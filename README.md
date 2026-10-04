@@ -41,19 +41,21 @@ Without `-c` it exports every constant reachable from the module, like `lean4exp
 
 ## Performance
 
+Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`.
+
 Wall time:
 
 | Target                    | lean4export | tiny-olean | Speedup |
 | ------------------------- | ----------- | ---------- | ------- |
-| Small model on `Lean`     | 18.3s       | 4.5s       | 4x      |
-| Mathlib-dependent library | 1541s       | 64s        | 24x     |
+| Small model on `Lean`     | 18.3s       | 1.6s       | 11x     |
+| Mathlib-dependent library | 1541s       | 37s        | 42x     |
 
 Peak memory:
 
 | Target                    | lean4export | tiny-olean |
 | ------------------------- | ----------- | ---------- |
-| Small model on `Lean`     | 1.3 GB      | 0.7 GB     |
-| Mathlib-dependent library | 9.4 GB      | 5.2 GB     |
+| Small model on `Lean`     | 1.3 GB      | 0.8 GB     |
+| Mathlib-dependent library | 9.4 GB      | 5.3 GB     |
 
 ## License
 

@@ -7,6 +7,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     rc::Rc,
+    thread,
     time::{Duration, Instant},
 };
 use tiny_olean::{search_path, with_big_stack, Env, Exporter};
@@ -30,6 +31,9 @@ struct Cli {
     /// Search DIR before `LEAN_PATH` (repeatable)
     #[arg(short = 'L', long = "search", value_name = "DIR")]
     search: Vec<PathBuf>,
+    /// Decode modules on N threads [default: all cores]
+    #[arg(short, long, value_name = "N")]
+    jobs: Option<usize>,
     /// No progress bars or summary
     #[arg(short, long)]
     quiet: bool,
@@ -92,7 +96,11 @@ fn run(cli: &Cli) -> io::Result<()> {
         None,
         "{spinner:.cyan} decoding [{elapsed}] {msg}",
     );
-    let env = Env::load_with(&search, &roots, &mut |env| {
+    let jobs = cli
+        .jobs
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
+    pb.set_message(format!("finding modules, {jobs} threads"));
+    let env = Env::load_with(&search, &roots, jobs, &mut |env: &Env| {
         if let Some(m) = env.modules.last() {
             pb.set_message(format!(
                 "{} modules, {} constants  {m}",

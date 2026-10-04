@@ -1,5 +1,6 @@
 use crate::olean::{is_scalar, small_nat, Header, Image};
 use hashbrown::{hash_table::Entry, HashTable};
+use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
     hash::{BuildHasher, Hash},
@@ -226,6 +227,13 @@ impl<T: Hash + Eq> Table<T> {
         }
     }
 
+    fn reserve(&mut self, n: usize) {
+        let hashes = &self.hashes;
+        self.index.reserve(n, |&i| hashes[i as usize]);
+        self.nodes.reserve(n);
+        self.hashes.reserve(n);
+    }
+
     pub fn get(&self, t: &T) -> Option<u32> {
         let h = FxBuildHasher.hash_one(t);
         self.index
@@ -285,20 +293,72 @@ impl Env {
 
     /// Load `roots` and their transitive imports, resolving modules against `search`.
     pub fn load(search: &[PathBuf], roots: &[&str]) -> io::Result<Self> {
-        Self::load_with(search, roots, &mut |_| {})
+        let jobs = std::thread::available_parallelism().map_or(1, usize::from);
+        Self::load_with(search, roots, jobs, &mut |_| {})
     }
 
-    /// Like [`Env::load`], calling `progress` after each module is decoded.
+    /// Like [`Env::load`] on `jobs` threads, calling `progress` after each module is merged.
+    ///
+    /// Modules decode in parallel into private tables, which are merged into `self` in import
+    /// order, so the result is the same for any `jobs`.
     pub fn load_with(
         search: &[PathBuf],
         roots: &[&str],
-        progress: &mut dyn FnMut(&Self),
+        jobs: usize,
+        progress: &mut (dyn FnMut(&Self) + Send),
     ) -> io::Result<Self> {
-        let mut env = Self::new();
         let mut seen = FxHashSet::default();
+        let mut found = Vec::new();
         for root in roots {
-            env.visit(search, root, &mut seen, progress)?;
+            discover(search, root, &mut seen, &mut found)?;
         }
+        // Sizing the shared tables up front avoids rehashing them while they grow, which was
+        // a quarter of merge time. Across Lean and Mathlib there is about one expression per
+        // 64 bytes of olean and one name per 1200.
+        let bytes: u64 = found
+            .iter()
+            .flat_map(|(_, p)| {
+                ["olean", "olean.server", "olean.private"].map(|e| p.with_extension(e))
+            })
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        let mut env = Self::new();
+        let estimate = |per: u64| usize::try_from(bytes / per).unwrap_or(0);
+        env.exprs.reserve(estimate(64));
+        env.names.reserve(estimate(1200));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs.max(1))
+            .stack_size(crate::STACK)
+            .build()
+            .map_err(io::Error::other)?;
+        pool.install(|| {
+            let mut found = found.into_iter();
+            let mut ready = Vec::new();
+            loop {
+                let batch: Vec<_> = found.by_ref().take(jobs.max(1) * 8).collect();
+                if batch.is_empty() && ready.is_empty() {
+                    break;
+                }
+                let merging = std::mem::take(&mut ready);
+                let ((), next) = rayon::join(
+                    || {
+                        for (module, local) in merging {
+                            env.merge(local, module);
+                            progress(&env);
+                        }
+                    },
+                    || {
+                        batch
+                            .into_par_iter()
+                            .map(|(module, path)| Ok((module, Self::decode(&path)?)))
+                            .collect::<io::Result<Vec<_>>>()
+                    },
+                );
+                ready = next?;
+            }
+            Ok::<_, io::Error>(())
+        })?;
         Ok(env)
     }
 
@@ -307,42 +367,164 @@ impl Env {
         self.order.iter().copied().filter(|&c| !self.is_internal(c))
     }
 
-    fn visit(
-        &mut self,
-        search: &[PathBuf],
-        module: &str,
-        seen: &mut FxHashSet<String>,
-        progress: &mut dyn FnMut(&Self),
-    ) -> io::Result<()> {
-        if !seen.insert(module.to_owned()) {
-            return Ok(());
-        }
-        let path = resolve(search, module)?;
-        let mut img = Image::open(&path)?;
-        let data = img.root;
-        let imports: Vec<String> = img
-            .array(img.field(data, 0))
-            .map(|i| img.str_name(img.field(i, 0)))
-            .collect();
-        for import in &imports {
-            self.visit(search, import, seen, progress)?;
-        }
-        if img.scalar_u8(data, 0) == 1 {
+    fn decode(path: &Path) -> io::Result<Self> {
+        let mut img = Image::open(path)?;
+        if img.scalar_u8(img.root, 0) == 1 {
             img.push_part(&path.with_extension("olean.server"))?;
             img.push_part(&path.with_extension("olean.private"))?;
         }
-        self.header = img.header.clone();
+        let img = &img;
+        let mut env = Self::new();
+        env.header = img.header.clone();
         let mut dec = Decoder {
-            img: &img,
-            env: self,
+            img,
+            env: &mut env,
             memo: vec![0; img.slots()],
         };
         for c in img.array(img.field(img.root, 2)) {
             dec.constant(c);
         }
-        self.modules.push(module.to_owned());
-        progress(self);
-        Ok(())
+        Ok(env)
+    }
+
+    /// Re-intern a module's private tables into `self`. Children always have smaller ids
+    /// than their parents, so one forward pass over each table suffices.
+    fn merge(&mut self, local: Self, module: String) {
+        let mut nm = Vec::with_capacity(local.names.len());
+        for n in local.names.nodes {
+            nm.push(match n {
+                Name::Anon => ANON,
+                Name::Str(p, s) => self.names.intern(Name::Str(nm[p as usize], s)),
+                Name::Num(p, i) => self.names.intern(Name::Num(nm[p as usize], i)),
+            });
+        }
+        let n = |x: NameId| nm[x as usize];
+        let ns = |v: Vec<NameId>| v.into_iter().map(n).collect::<Vec<_>>();
+        let mut lm = Vec::with_capacity(local.levels.len());
+        for l in local.levels.nodes {
+            let l = match l {
+                Level::Zero => Level::Zero,
+                Level::Succ(a) => Level::Succ(lm[a as usize]),
+                Level::Max(a, b) => Level::Max(lm[a as usize], lm[b as usize]),
+                Level::IMax(a, b) => Level::IMax(lm[a as usize], lm[b as usize]),
+                Level::Param(p) => Level::Param(n(p)),
+            };
+            lm.push(self.levels.intern(l));
+        }
+        let mut em: Vec<ExprId> = Vec::with_capacity(local.exprs.len());
+        for e in local.exprs.nodes {
+            let x = |i: ExprId| em[i as usize];
+            let e = match e {
+                Expr::BVar(i) => Expr::BVar(i),
+                Expr::Sort(l) => Expr::Sort(lm[l as usize]),
+                Expr::Const(c, us) => {
+                    Expr::Const(n(c), us.iter().map(|&u| lm[u as usize]).collect())
+                }
+                Expr::App(f, a) => Expr::App(x(f), x(a)),
+                Expr::Lam(b, t, v, bi) => Expr::Lam(n(b), x(t), x(v), bi),
+                Expr::Pi(b, t, v, bi) => Expr::Pi(n(b), x(t), x(v), bi),
+                Expr::Let(b, t, v, body) => Expr::Let(n(b), x(t), x(v), x(body)),
+                lit @ (Expr::Nat(_) | Expr::Str(_)) => lit,
+                Expr::Proj(s, i, v) => Expr::Proj(n(s), i, x(v)),
+            };
+            let id = self.exprs.intern(e);
+            em.push(id);
+        }
+        let x = |i: ExprId| em[i as usize];
+        let mut consts = local.consts;
+        for c in local.order {
+            let k = consts
+                .remove(&c)
+                .expect("every ordered constant was decoded");
+            let kind = match k.kind {
+                Kind::Defn { value, hints, all } => Kind::Defn {
+                    value: x(value),
+                    hints,
+                    all: ns(all),
+                },
+                Kind::Thm { value, all } => Kind::Thm {
+                    value: x(value),
+                    all: ns(all),
+                },
+                Kind::Opaque { value, all } => Kind::Opaque {
+                    value: x(value),
+                    all: ns(all),
+                },
+                Kind::Induct {
+                    num_params,
+                    num_indices,
+                    all,
+                    ctors,
+                    num_nested,
+                    is_rec,
+                    is_reflexive,
+                } => Kind::Induct {
+                    num_params,
+                    num_indices,
+                    all: ns(all),
+                    ctors: ns(ctors),
+                    num_nested,
+                    is_rec,
+                    is_reflexive,
+                },
+                Kind::Ctor {
+                    induct,
+                    cidx,
+                    num_params,
+                    num_fields,
+                } => Kind::Ctor {
+                    induct: n(induct),
+                    cidx,
+                    num_params,
+                    num_fields,
+                },
+                Kind::Rec {
+                    all,
+                    num_params,
+                    num_indices,
+                    num_motives,
+                    num_minors,
+                    rules,
+                    k,
+                } => Kind::Rec {
+                    all: ns(all),
+                    num_params,
+                    num_indices,
+                    num_motives,
+                    num_minors,
+                    rules: rules
+                        .into_iter()
+                        .map(|r| Rule {
+                            ctor: n(r.ctor),
+                            nfields: r.nfields,
+                            rhs: x(r.rhs),
+                        })
+                        .collect(),
+                    k,
+                },
+                other @ (Kind::Axiom | Kind::Quot(_)) => other,
+            };
+            let name = n(c);
+            self.order.push(name);
+            self.consts.insert(
+                name,
+                Const {
+                    name,
+                    level_params: ns(k.level_params),
+                    ty: x(k.ty),
+                    kind,
+                },
+            );
+        }
+        for (ind, recs) in local.recursors {
+            self.recursors
+                .entry(n(ind))
+                .or_default()
+                .extend(recs.into_iter().map(n));
+        }
+        self.skipped += local.skipped;
+        self.header = local.header;
+        self.modules.push(module);
     }
 
     /// Look up a dotted name such as `Nat.add` without interning it.
@@ -375,6 +557,30 @@ impl Env {
             Name::Num(p, _) => self.is_internal(*p),
         }
     }
+}
+
+/// Find `module` and its imports, appending them to `out` in import order.
+fn discover(
+    search: &[PathBuf],
+    module: &str,
+    seen: &mut FxHashSet<String>,
+    out: &mut Vec<(String, PathBuf)>,
+) -> io::Result<()> {
+    if !seen.insert(module.to_owned()) {
+        return Ok(());
+    }
+    let path = resolve(search, module)?;
+    let img = Image::open(&path)?;
+    let imports: Vec<String> = img
+        .array(img.field(img.root, 0))
+        .map(|i| img.str_name(img.field(i, 0)))
+        .collect();
+    drop(img);
+    for import in &imports {
+        discover(search, import, seen, out)?;
+    }
+    out.push((module.to_owned(), path));
+    Ok(())
 }
 
 fn resolve(search: &[PathBuf], module: &str) -> io::Result<PathBuf> {

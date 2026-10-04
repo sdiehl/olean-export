@@ -21,10 +21,12 @@ pub use env::{
 pub use export::Exporter;
 pub use olean::Header;
 
+const STACK: usize = 1 << 30;
+
 /// Run `f` on a thread with a stack deep enough for long application spines and binder chains.
 pub fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
-        .stack_size(1 << 30)
+        .stack_size(STACK)
         .spawn(f)
         .expect("spawn")
         .join()
