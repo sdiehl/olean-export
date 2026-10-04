@@ -14,6 +14,8 @@ description = "Read Lean 4 .olean files directly in Rust and emit the lean4expor
 clap = { version = "4.6.7", features = ["derive"] }
 hashbrown = "0.17"
 indicatif = "0.18.6"
+itoa = "1.0.18"
+memmap2 = "0.9.11"
 rustc-hash = "2"
 
 [[example]]
@@ -21,7 +23,7 @@ name = "demo"
 path = "examples/demo.rs"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }

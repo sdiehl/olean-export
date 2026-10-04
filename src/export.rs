@@ -25,6 +25,51 @@ pub struct Exporter<'a, W: Write> {
     nat: Option<NameId>,
     str_deps: [Option<NameId>; 2],
     quot: [Option<NameId>; 5],
+    buf: Line,
+}
+
+/// A reusable output line, since `format!` per record dominated export time.
+#[derive(Debug, Default)]
+struct Line(Vec<u8>);
+
+impl Line {
+    fn s(&mut self, s: &str) -> &mut Self {
+        self.0.extend_from_slice(s.as_bytes());
+        self
+    }
+
+    fn n(&mut self, n: impl itoa::Integer) -> &mut Self {
+        self.s(itoa::Buffer::new().format(n))
+    }
+
+    fn list(&mut self, ids: &[u32]) -> &mut Self {
+        self.s("[");
+        for (i, &id) in ids.iter().enumerate() {
+            if i > 0 {
+                self.s(",");
+            }
+            self.n(id);
+        }
+        self.s("]")
+    }
+
+    fn q(&mut self, s: &str) -> &mut Self {
+        self.s("\"");
+        for c in s.chars() {
+            match c {
+                '"' => self.s("\\\""),
+                '\\' => self.s("\\\\"),
+                '\n' => self.s("\\n"),
+                '\r' => self.s("\\r"),
+                '\t' => self.s("\\t"),
+                c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                    self.s("\\u00").s(&format!("{:02x}", c as u32))
+                }
+                c => self.s(c.encode_utf8(&mut [0; 4])),
+            };
+        }
+        self.s("\"")
+    }
 }
 
 impl<'a, W: Write> Exporter<'a, W> {
@@ -52,6 +97,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 find("Quot.lift"),
                 find("Quot.ind"),
             ],
+            buf: Line::default(),
         }
     }
 
@@ -82,6 +128,16 @@ impl<'a, W: Write> Exporter<'a, W> {
         Ok(self.out)
     }
 
+    fn start(&mut self) -> &mut Line {
+        self.buf.0.clear();
+        &mut self.buf
+    }
+
+    fn emit(&mut self) -> io::Result<()> {
+        self.buf.0.push(b'\n');
+        self.out.write_all(&self.buf.0)
+    }
+
     fn line(&mut self, s: &str) -> io::Result<()> {
         self.out.write_all(s.as_bytes())?;
         self.out.write_all(b"\n")
@@ -97,20 +153,26 @@ impl<'a, W: Write> Exporter<'a, W> {
         if self.names[n as usize] != UNSEEN {
             return Ok(self.names[n as usize]);
         }
-        let s = match &self.env.names[n] {
+        match &self.env.names[n] {
             Name::Anon => unreachable!(),
             Name::Str(p, s) => {
                 let p = self.name(*p)?;
                 let id = self.fresh(0);
-                format!(r#"{{"in":{id},"str":{{"pre":{p},"str":{}}}}}"#, quote(s))
+                self.start()
+                    .s(r#"{"in":"#)
+                    .n(id)
+                    .s(r#","str":{"pre":"#)
+                    .n(p);
+                self.buf.s(r#","str":"#).q(s).s("}}");
             }
             Name::Num(p, i) => {
                 let p = self.name(*p)?;
                 let id = self.fresh(0);
-                format!(r#"{{"in":{id},"num":{{"i":{i},"pre":{p}}}}}"#)
+                self.start().s(r#"{"in":"#).n(id).s(r#","num":{"i":"#).n(*i);
+                self.buf.s(r#","pre":"#).n(p).s("}}");
             }
-        };
-        self.line(&s)?;
+        }
+        self.emit()?;
         self.names[n as usize] = self.next[0] - 1;
         Ok(self.next[0] - 1)
     }
@@ -140,15 +202,27 @@ impl<'a, W: Write> Exporter<'a, W> {
         if self.levels[l as usize] != UNSEEN {
             return Ok(self.levels[l as usize]);
         }
-        let body = match self.env.levels[l] {
+        let (key, a, b) = match self.env.levels[l] {
             Level::Zero => unreachable!(),
-            Level::Succ(a) => format!(r#""succ":{}"#, self.level(a)?),
-            Level::Max(a, b) => format!(r#""max":[{},{}]"#, self.level(a)?, self.level(b)?),
-            Level::IMax(a, b) => format!(r#""imax":[{},{}]"#, self.level(a)?, self.level(b)?),
-            Level::Param(n) => format!(r#""param":{}"#, self.name(n)?),
+            Level::Succ(a) => ("succ", self.level(a)?, None),
+            Level::Max(a, b) => ("max", self.level(a)?, Some(self.level(b)?)),
+            Level::IMax(a, b) => ("imax", self.level(a)?, Some(self.level(b)?)),
+            Level::Param(n) => ("param", self.name(n)?, None),
         };
         let id = self.fresh(1);
-        self.line(&format!(r#"{{"il":{id},{body}}}"#))?;
+        let line = self
+            .start()
+            .s(r#"{"il":"#)
+            .n(id)
+            .s(r#",""#)
+            .s(key)
+            .s(r#"":"#);
+        match b {
+            None => line.n(a),
+            Some(b) => line.s("[").n(a).s(",").n(b).s("]"),
+        }
+        .s("}");
+        self.emit()?;
         self.levels[l as usize] = id;
         Ok(id)
     }
@@ -157,11 +231,25 @@ impl<'a, W: Write> Exporter<'a, W> {
         if self.exprs[e as usize] != UNSEEN {
             return Ok(self.exprs[e as usize]);
         }
-        let s = match &self.env.exprs[e] {
-            Expr::BVar(i) => format!(r#"{{"bvar":{i},"ie":{}}}"#, self.fresh(2)),
+        match &self.env.exprs[e] {
+            Expr::BVar(i) => {
+                let id = self.fresh(2);
+                self.start()
+                    .s(r#"{"bvar":"#)
+                    .n(*i)
+                    .s(r#","ie":"#)
+                    .n(id)
+                    .s("}");
+            }
             Expr::Sort(l) => {
                 let l = self.level(*l)?;
-                format!(r#"{{"ie":{},"sort":{l}}}"#, self.fresh(2))
+                let id = self.fresh(2);
+                self.start()
+                    .s(r#"{"ie":"#)
+                    .n(id)
+                    .s(r#","sort":"#)
+                    .n(l)
+                    .s("}");
             }
             Expr::Const(n, us) => {
                 let n = self.name(*n)?;
@@ -169,27 +257,35 @@ impl<'a, W: Write> Exporter<'a, W> {
                     .iter()
                     .map(|&u| self.level(u))
                     .collect::<io::Result<Vec<_>>>()?;
-                format!(
-                    r#"{{"const":{{"name":{n},"us":{}}},"ie":{}}}"#,
-                    json_list(&us),
-                    self.fresh(2)
-                )
+                let id = self.fresh(2);
+                self.start().s(r#"{"const":{"name":"#).n(n).s(r#","us":"#);
+                self.buf.list(&us).s(r#"},"ie":"#).n(id).s("}");
             }
             Expr::App(f, a) => {
                 let (f, a) = (self.expr(*f)?, self.expr(*a)?);
-                format!(r#"{{"app":{{"arg":{a},"fn":{f}}},"ie":{}}}"#, self.fresh(2))
+                let id = self.fresh(2);
+                self.start().s(r#"{"app":{"arg":"#).n(a).s(r#","fn":"#).n(f);
+                self.buf.s(r#"},"ie":"#).n(id).s("}");
             }
             Expr::Lam(n, t, b, bi) | Expr::Pi(n, t, b, bi) => {
                 let (n, t, b) = (self.name(*n)?, self.expr(*t)?, self.expr(*b)?);
-                let body = format!(
-                    r#"{{"binderInfo":"{}","body":{b},"name":{n},"type":{t}}}"#,
-                    binder(*bi)
-                );
                 let id = self.fresh(2);
-                if matches!(self.env.exprs[e], Expr::Lam(..)) {
-                    format!(r#"{{"ie":{id},"lam":{body}}}"#)
+                let lam = matches!(self.env.exprs[e], Expr::Lam(..));
+                let line = self.start();
+                if lam {
+                    line.s(r#"{"ie":"#).n(id).s(r#","lam":"#);
                 } else {
-                    format!(r#"{{"forallE":{body},"ie":{id}}}"#)
+                    line.s(r#"{"forallE":"#);
+                }
+                line.s(r#"{"binderInfo":""#)
+                    .s(binder(*bi))
+                    .s(r#"","body":"#)
+                    .n(b);
+                line.s(r#","name":"#).n(n).s(r#","type":"#).n(t).s("}");
+                if lam {
+                    line.s("}");
+                } else {
+                    line.s(r#","ie":"#).n(id).s("}");
                 }
             }
             Expr::Let(n, t, v, b) => {
@@ -200,31 +296,59 @@ impl<'a, W: Write> Exporter<'a, W> {
                     self.expr(*b)?,
                 );
                 let id = self.fresh(2);
-                format!(
-                    r#"{{"ie":{id},"letE":{{"body":{b},"name":{n},"nondep":false,"type":{t},"value":{v}}}}}"#
-                )
+                self.start()
+                    .s(r#"{"ie":"#)
+                    .n(id)
+                    .s(r#","letE":{"body":"#)
+                    .n(b);
+                self.buf
+                    .s(r#","name":"#)
+                    .n(n)
+                    .s(r#","nondep":false,"type":"#)
+                    .n(t);
+                self.buf.s(r#","value":"#).n(v).s("}}");
             }
             Expr::Nat(v) => {
                 if let Some(nat) = self.nat {
                     self.constant(nat)?;
                 }
-                format!(r#"{{"ie":{},"natVal":"{v}"}}"#, self.fresh(2))
+                let id = self.fresh(2);
+                self.start()
+                    .s(r#"{"ie":"#)
+                    .n(id)
+                    .s(r#","natVal":""#)
+                    .s(v)
+                    .s(r#""}"#);
             }
             Expr::Str(v) => {
                 for c in self.str_deps.into_iter().flatten() {
                     self.constant(c)?;
                 }
-                format!(r#"{{"ie":{},"strVal":{}}}"#, self.fresh(2), quote(v))
+                let id = self.fresh(2);
+                self.start()
+                    .s(r#"{"ie":"#)
+                    .n(id)
+                    .s(r#","strVal":"#)
+                    .q(v)
+                    .s("}");
             }
             Expr::Proj(n, i, x) => {
                 let (n, x) = (self.name(*n)?, self.expr(*x)?);
-                format!(
-                    r#"{{"ie":{},"proj":{{"idx":{i},"struct":{x},"typeName":{n}}}}}"#,
-                    self.fresh(2)
-                )
+                let id = self.fresh(2);
+                self.start()
+                    .s(r#"{"ie":"#)
+                    .n(id)
+                    .s(r#","proj":{"idx":"#)
+                    .n(*i);
+                self.buf
+                    .s(r#","struct":"#)
+                    .n(x)
+                    .s(r#","typeName":"#)
+                    .n(n)
+                    .s("}}");
             }
-        };
-        self.line(&s)?;
+        }
+        self.emit()?;
         self.exprs[e as usize] = self.next[2] - 1;
         Ok(self.next[2] - 1)
     }
@@ -476,24 +600,4 @@ fn json_list(ids: &[u32]) -> String {
     }
     s.push(']');
     s
-}
-
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

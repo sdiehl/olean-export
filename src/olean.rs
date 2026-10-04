@@ -1,4 +1,5 @@
-use std::{fmt::Write as _, fs, io, path::Path};
+use memmap2::{Mmap, MmapOptions};
+use std::{fmt::Write as _, fs::File, io, path::Path};
 
 const ARRAY: u8 = 246;
 const STRING: u8 = 249;
@@ -15,7 +16,8 @@ pub struct Header {
 #[derive(Debug)]
 struct Part {
     base: u64,
-    bytes: Vec<u8>,
+    slot: usize,
+    bytes: Mmap,
 }
 
 /// One module's compacted regions. Objects are addressed by the absolute pointers the
@@ -50,7 +52,12 @@ impl Image {
     }
 
     pub(crate) fn push_part(&mut self, path: &Path) -> io::Result<()> {
-        let bytes = fs::read(path)?;
+        let file = File::open(path)?;
+        // SAFETY: the map is read-only and lives as long as `self`. Rewriting an .olean while
+        // it is being read is undefined behaviour, the same assumption Lean makes when it maps them.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { MmapOptions::new().populate().map(&file)? };
+        bytes.advise(memmap2::Advice::WillNeed)?;
         if bytes.len() < 96 || &bytes[..5] != b"olean" {
             return Err(invalid(path, "not an olean file"));
         }
@@ -66,8 +73,27 @@ impl Image {
         };
         let base = le64(&bytes[80..88]);
         self.root = le64(&bytes[root_at..root_at + 8]);
-        self.parts.push(Part { base, bytes });
+        let slot = self.slots();
+        self.parts.push(Part { base, slot, bytes });
         Ok(())
+    }
+
+    /// One past the largest slot, where every 8-byte aligned object address has a slot.
+    pub(crate) fn slots(&self) -> usize {
+        self.parts.last().map_or(0, |p| p.slot + p.bytes.len() / 8)
+    }
+
+    /// A dense index for the object at `addr`, for memo tables.
+    pub(crate) fn slot(&self, addr: u64) -> usize {
+        for p in &self.parts {
+            if let Some(off) = addr.checked_sub(p.base) {
+                let off = usize::try_from(off).unwrap_or(usize::MAX);
+                if off < p.bytes.len() {
+                    return p.slot + off / 8;
+                }
+            }
+        }
+        panic!("pointer {addr:#x} is outside every region of this module")
     }
 
     fn bytes(&self, addr: u64, len: usize) -> &[u8] {

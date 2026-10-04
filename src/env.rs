@@ -54,26 +54,20 @@ pub enum Expr {
     Proj(NameId, u64, ExprId),
 }
 
-impl Expr {
-    fn key(&self) -> (u8, u64, u64, u64, Option<&str>, Option<&[LevelId]>) {
-        match self {
-            Self::BVar(i) => (0, *i, 0, 0, None, None),
-            Self::Sort(l) => (1, (*l).into(), 0, 0, None, None),
-            Self::Const(n, us) => (2, (*n).into(), 0, 0, None, Some(us)),
-            Self::App(f, a) => (3, (*f).into(), (*a).into(), 0, None, None),
-            Self::Lam(_, t, b, _) => (4, (*t).into(), (*b).into(), 0, None, None),
-            Self::Pi(_, t, b, _) => (5, (*t).into(), (*b).into(), 0, None, None),
-            Self::Let(_, t, v, b) => (6, (*t).into(), (*v).into(), (*b).into(), None, None),
-            Self::Nat(v) => (7, 0, 0, 0, Some(v), None),
-            Self::Str(v) => (8, 0, 0, 0, Some(v), None),
-            Self::Proj(n, i, x) => (9, (*n).into(), *i, (*x).into(), None, None),
-        }
-    }
-}
-
 impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
+        match (self, other) {
+            (Self::BVar(a), Self::BVar(b)) => a == b,
+            (Self::Sort(a), Self::Sort(b)) => a == b,
+            (Self::Const(n, us), Self::Const(m, vs)) => n == m && us == vs,
+            (Self::App(f, a), Self::App(g, b)) => f == g && a == b,
+            (Self::Lam(_, t, b, _), Self::Lam(_, u, c, _))
+            | (Self::Pi(_, t, b, _), Self::Pi(_, u, c, _)) => t == u && b == c,
+            (Self::Let(_, t, v, b), Self::Let(_, u, w, c)) => t == u && v == w && b == c,
+            (Self::Nat(a), Self::Nat(b)) | (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Proj(n, i, x), Self::Proj(m, j, y)) => n == m && i == j && x == y,
+            _ => false,
+        }
     }
 }
 
@@ -81,7 +75,44 @@ impl Eq for Expr {}
 
 impl Hash for Expr {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        self.key().hash(h);
+        let pack = |a: u32, b: u32| u64::from(a) << 32 | u64::from(b);
+        match self {
+            Self::BVar(i) => h.write_u64(*i),
+            Self::Sort(l) => h.write_u32(*l),
+            Self::Const(n, us) => {
+                h.write_u32(*n);
+                us.iter().for_each(|&u| h.write_u32(u));
+            }
+            Self::App(f, a) => h.write_u64(pack(*f, *a)),
+            Self::Lam(_, t, b, _) | Self::Pi(_, t, b, _) => h.write_u64(pack(*t, *b)),
+            Self::Let(_, t, v, b) => {
+                h.write_u64(pack(*t, *v));
+                h.write_u32(*b);
+            }
+            Self::Nat(v) | Self::Str(v) => h.write(v.as_bytes()),
+            Self::Proj(n, i, x) => {
+                h.write_u64(pack(*n, *x));
+                h.write_u64(*i);
+            }
+        }
+        h.write_u8(self.tag());
+    }
+}
+
+impl Expr {
+    const fn tag(&self) -> u8 {
+        match self {
+            Self::BVar(_) => 0,
+            Self::Sort(_) => 1,
+            Self::Const(..) => 2,
+            Self::App(..) => 3,
+            Self::Lam(..) => 4,
+            Self::Pi(..) => 5,
+            Self::Let(..) => 6,
+            Self::Nat(_) => 7,
+            Self::Str(_) => 8,
+            Self::Proj(..) => 9,
+        }
     }
 }
 
@@ -163,6 +194,7 @@ pub struct Const {
 #[derive(Debug)]
 pub struct Table<T> {
     pub nodes: Vec<T>,
+    hashes: Vec<u64>,
     index: HashTable<u32>,
 }
 
@@ -170,23 +202,25 @@ impl<T: Hash + Eq> Table<T> {
     const fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            hashes: Vec::new(),
             index: HashTable::new(),
         }
     }
 
     pub fn intern(&mut self, t: T) -> u32 {
         let h = FxBuildHasher.hash_one(&t);
-        let nodes = &self.nodes;
+        let (nodes, hashes) = (&self.nodes, &self.hashes);
         match self.index.entry(
             h,
-            |&i| nodes[i as usize] == t,
-            |&i| FxBuildHasher.hash_one(&nodes[i as usize]),
+            |&i| hashes[i as usize] == h && nodes[i as usize] == t,
+            |&i| hashes[i as usize],
         ) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
                 let id = u32::try_from(self.nodes.len()).expect("table overflow");
                 e.insert(id);
                 self.nodes.push(t);
+                self.hashes.push(h);
                 id
             }
         }
@@ -301,9 +335,7 @@ impl Env {
         let mut dec = Decoder {
             img: &img,
             env: self,
-            names: FxHashMap::default(),
-            levels: FxHashMap::default(),
-            exprs: FxHashMap::default(),
+            memo: vec![0; img.slots()],
         };
         for c in img.array(img.field(img.root, 2)) {
             dec.constant(c);
@@ -381,17 +413,27 @@ impl Image {
 struct Decoder<'a> {
     img: &'a Image,
     env: &'a mut Env,
-    names: FxHashMap<u64, NameId>,
-    levels: FxHashMap<u64, LevelId>,
-    exprs: FxHashMap<u64, ExprId>,
+    /// Table id plus one for each decoded object, by slot. An object is only ever decoded as
+    /// one of name, level or expression, so the kinds can share it.
+    memo: Vec<u32>,
 }
 
 impl Decoder<'_> {
+    fn seen(&self, o: u64) -> Option<u32> {
+        self.memo[self.img.slot(o)].checked_sub(1)
+    }
+
+    fn remember(&mut self, o: u64, id: u32) -> u32 {
+        let slot = self.img.slot(o);
+        self.memo[slot] = id + 1;
+        id
+    }
+
     fn name(&mut self, o: u64) -> NameId {
         if is_scalar(o) || self.img.tag(o) == 0 {
             return ANON;
         }
-        if let Some(&id) = self.names.get(&o) {
+        if let Some(id) = self.seen(o) {
             return id;
         }
         let pre = self.name(self.img.field(o, 0));
@@ -401,8 +443,7 @@ impl Decoder<'_> {
             _ => Name::Num(pre, small_nat(arg)),
         };
         let id = self.env.names.intern(n);
-        self.names.insert(o, id);
-        id
+        self.remember(o, id)
     }
 
     fn names(&mut self, o: u64) -> Vec<NameId> {
@@ -413,7 +454,7 @@ impl Decoder<'_> {
         if is_scalar(o) || self.img.tag(o) == 0 {
             return ZERO;
         }
-        if let Some(&id) = self.levels.get(&o) {
+        if let Some(id) = self.seen(o) {
             return id;
         }
         let img = self.img;
@@ -425,12 +466,11 @@ impl Decoder<'_> {
             t => panic!("unexpected level tag {t}"),
         };
         let id = self.env.levels.intern(l);
-        self.levels.insert(o, id);
-        id
+        self.remember(o, id)
     }
 
     fn expr(&mut self, o: u64) -> ExprId {
-        if let Some(&id) = self.exprs.get(&o) {
+        if let Some(id) = self.seen(o) {
             return id;
         }
         let img = self.img;
@@ -477,15 +517,13 @@ impl Decoder<'_> {
             }
             10 => {
                 let id = self.expr(f(1));
-                self.exprs.insert(o, id);
-                return id;
+                return self.remember(o, id);
             }
             11 => Expr::Proj(self.name(f(0)), small_nat(f(1)), self.expr(f(2))),
             t => panic!("unexpected expression tag {t} (free or meta variable in a declaration)"),
         };
         let id = self.env.exprs.intern(e);
-        self.exprs.insert(o, id);
-        id
+        self.remember(o, id)
     }
 
     fn constant(&mut self, info: u64) {
