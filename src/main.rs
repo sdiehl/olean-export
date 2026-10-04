@@ -13,6 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Read Lean 4 .olean files directly and emit the lean4export NDJSON stream.
 #[derive(Debug, Parser)]
 #[command(

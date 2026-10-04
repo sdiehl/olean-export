@@ -7,10 +7,10 @@ The big idea is an `.olean` is already a compacted heap image of `lean.h` object
 The object layout is tied to the Lean release. This version reads olean format v2 as written by Lean 4.26 through 4.35, and refuses files from any other release.
 
 ```bash
-cargo build --release
-cargo test
-cargo run --example demo
+cargo install olean-export
 ```
+
+Add `--features mimalloc` to build with the mimalloc allocator.
 
 ## Example
 
