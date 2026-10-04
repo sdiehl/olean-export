@@ -2,7 +2,7 @@
 
 Rust library to read Lean 4 `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
 
-The big idea is an `.olean` is a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But like fast.
+The big idea is an `.olean` is already a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But much faster.
 
 The object layout is tied to the Lean release. This version targets olean format v2 as written by Lean 4.34 and 4.35.
 
@@ -24,7 +24,6 @@ theorem double_two : double 2 = 4 := rfl
 
 ```bash
 lean -o Hello.olean Hello.lean
-export LEAN_PATH=.:$(lean --print-prefix)/lib/lean
 ```
 
 Export one theorem with everything it depends on, then check it with a kernel. Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
@@ -33,11 +32,6 @@ Export one theorem with everything it depends on, then check it with a kernel. I
 $ lake env tiny-olean Hello -c double_two -o hello.ndjson
 654 modules, 65,373 constants decoded in 1.41s
 36.82 KiB of NDJSON (138 names, 16 levels, 490 exprs) in 1.41s total, 11.99 MiB/s
-
-$ head -3 hello.ndjson
-{"meta":{"exporter":{"name":"tiny-olean","version":"0.1.0"},"format":{"version":"3.1.0"},...}}
-{"in":1,"str":{"pre":0,"str":"Eq"}}
-{"in":2,"str":{"pre":1,"str":"refl"}}
 
 $ sokonanoda --nat-extension --print-success-message --stdin < hello.ndjson
 Checked 39 declarations with no errors
