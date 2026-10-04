@@ -45,4 +45,4 @@ jobs:
         run: cargo run --example demo
 
       - name: Export fixtures with the CLI
-        run: ./target/release/tiny-olean Top -L tests/cases/build -o top.ndjson
+        run: ./target/release/olean-export Top -L tests/cases/build -o top.ndjson

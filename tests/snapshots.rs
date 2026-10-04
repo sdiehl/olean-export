@@ -1,5 +1,5 @@
+use olean_export::{Env, Exporter};
 use std::{fmt::Write as _, path::PathBuf};
-use tiny_olean::{Env, Exporter};
 
 fn build() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/build")
@@ -28,7 +28,7 @@ fn damaged() {
         ("future", future),
         ("garbage", b"not an olean at all".repeat(8)),
     ];
-    let dir = std::env::temp_dir().join(format!("tiny-olean-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("olean-export-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(build().join("Base.olean"), dir.join("Base.olean")).unwrap();
     let mut out = String::new();

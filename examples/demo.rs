@@ -1,7 +1,7 @@
 #![allow(clippy::many_single_char_names)]
 
+use olean_export::{Env, Expr, Kind, Level};
 use std::path::PathBuf;
-use tiny_olean::{Env, Expr, Kind, Level};
 
 fn level(env: &Env, l: u32) -> String {
     match env.levels[l] {

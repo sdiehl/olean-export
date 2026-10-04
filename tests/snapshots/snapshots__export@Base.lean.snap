@@ -3,7 +3,7 @@ source: tests/snapshots.rs
 expression: "String::from_utf8(ex.finish().unwrap()).unwrap()"
 input_file: tests/cases/Base.lean
 ---
-{"meta":{"exporter":{"name":"tiny-olean","version":"0.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"470d5ce1400764999581fd26d5d72b00d990b0f4","version":"4.35.0-rc3"}}}
+{"meta":{"exporter":{"name":"olean-export","version":"0.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"470d5ce1400764999581fd26d5d72b00d990b0f4","version":"4.35.0-rc3"}}}
 {"in":1,"str":{"pre":0,"str":"Pair"}}
 {"in":2,"str":{"pre":1,"str":"mk"}}
 {"in":3,"str":{"pre":0,"str":"u"}}

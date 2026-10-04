@@ -1,4 +1,4 @@
-# tiny-olean
+# olean-export
 
 Rust library to read Lean `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
 
@@ -29,7 +29,7 @@ lean -o Hello.olean Hello.lean
 Export one theorem with everything it depends on, then check it with a kernel. Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
 
 ```bash
-$ lake env tiny-olean Hello -c double_two -o hello.ndjson
+$ lake env olean-export Hello -c double_two -o hello.ndjson
 654 modules, 65,373 constants decoded in 1.41s
 36.82 KiB of NDJSON (138 names, 16 levels, 490 exprs) in 1.41s total, 11.99 MiB/s
 
@@ -45,17 +45,17 @@ Modules decode in parallel on every core, and `-j N` sets the thread count. The 
 
 Wall time:
 
-| Target                    | lean4export | tiny-olean | Speedup |
-| ------------------------- | ----------- | ---------- | ------- |
-| Small model on `Lean`     | 18.3s       | 1.0s       | 18x     |
-| Mathlib-dependent library | 1541s       | 15s        | 100x    |
+| Target                    | lean4export | olean-export | Speedup |
+| ------------------------- | ----------- | ------------ | ------- |
+| Small model on `Lean`     | 18.3s       | 1.0s         | 18x     |
+| Mathlib-dependent library | 1541s       | 15s          | 100x    |
 
 Peak memory:
 
-| Target                    | lean4export | tiny-olean |
-| ------------------------- | ----------- | ---------- |
-| Small model on `Lean`     | 1.3 GB      | 0.5 GB     |
-| Mathlib-dependent library | 9.4 GB      | 4.2 GB     |
+| Target                    | lean4export | olean-export |
+| ------------------------- | ----------- | ------------ |
+| Small model on `Lean`     | 1.3 GB      | 0.5 GB       |
+| Mathlib-dependent library | 9.4 GB      | 4.2 GB       |
 
 ## License
 

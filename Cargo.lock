@@ -376,6 +376,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "olean-export"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hashbrown",
+ "indicatif",
+ "insta",
+ "itoa",
+ "memmap2",
+ "parking_lot",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -598,21 +613,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
-]
-
-[[package]]
-name = "tiny-olean"
-version = "0.1.0"
-dependencies = [
- "clap",
- "hashbrown",
- "indicatif",
- "insta",
- "itoa",
- "memmap2",
- "parking_lot",
- "rayon",
- "rustc-hash",
 ]
 
 [[package]]

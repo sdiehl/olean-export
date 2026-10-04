@@ -1,5 +1,6 @@
 use clap::Parser;
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use olean_export::{search_path, with_big_stack, Env, Exporter};
 use std::{
     cell::Cell,
     fs::File,
@@ -10,13 +11,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tiny_olean::{search_path, with_big_stack, Env, Exporter};
 
 /// Read Lean 4 .olean files directly and emit the lean4export NDJSON stream.
 #[derive(Debug, Parser)]
 #[command(
     version,
-    after_help = "Run under `lake env` so LEAN_PATH covers your build and the toolchain:\n  lake env tiny-olean Mathlib -o mathlib.ndjson"
+    after_help = "Run under `lake env` so LEAN_PATH covers your build and the toolchain:\n  lake env olean-export Mathlib -o mathlib.ndjson"
 )]
 struct Cli {
     /// Root modules to load, e.g. `Mathlib` or `MyProject.Main`

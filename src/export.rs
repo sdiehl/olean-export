@@ -105,7 +105,7 @@ impl<'a, W: Write> Exporter<'a, W> {
         let h = &self.env.header;
         writeln!(
             self.out,
-            r#"{{"meta":{{"exporter":{{"name":"tiny-olean","version":"{}"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"{}","version":"{}"}}}}}}"#,
+            r#"{{"meta":{{"exporter":{{"name":"olean-export","version":"{}"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"{}","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION"),
             h.githash,
             h.version
