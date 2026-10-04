@@ -4,7 +4,7 @@ Rust library to read Lean `.olean` files directly in Rust and emit the [lean4exp
 
 The big idea is an `.olean` is already a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But much faster.
 
-The object layout is tied to the Lean release. This version reads olean format v2 as written by Lean 4.26 through 4.35, and refuses files from any other release rather than risk decoding them wrong. Damaged files produce an error, not a panic.
+The object layout is tied to the Lean release. This version reads olean format v2 as written by Lean 4.26 through 4.35, and refuses files from any other release.
 
 ```bash
 cargo build --release

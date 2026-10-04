@@ -1,17 +1,28 @@
-use crate::env::{
-    Binder, Const, Env, Expr, ExprId, Hints, Kind, Level, LevelId, Name, NameId, QuotKind, ANON,
-    ZERO,
+use crate::{
+    env::{
+        Binder, Const, Ctor, Env, Expr, ExprId, Hints, Inductive, Kind, Level, LevelId, Name,
+        NameId, QuotKind, Rec, ANON, ZERO,
+    },
+    error::{corrupt, Result},
 };
 use rustc_hash::FxHashSet;
-use std::{
-    fmt::Write as _,
-    io::{self, Write},
-};
+use std::{fmt::Write as _, io::Write};
 
 const UNSEEN: u32 = u32::MAX;
 
+/// Lines written so far for each table, which is also the next id each hands out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub names: u32,
+    pub levels: u32,
+    pub exprs: u32,
+}
+
 /// Streams an [`Env`] in the lean4export 3.1.0 NDJSON format. Ids are assigned on first
 /// use and every line only refers to lines already written.
+///
+/// Exporting recurses once per nested subterm, which overflows the default stack on large
+/// libraries such as Mathlib, so run it inside [`crate::with_big_stack`].
 #[derive(Debug)]
 pub struct Exporter<'a, W: Write> {
     env: &'a Env,
@@ -19,7 +30,7 @@ pub struct Exporter<'a, W: Write> {
     names: Vec<u32>,
     levels: Vec<u32>,
     exprs: Vec<u32>,
-    next: [u32; 3],
+    next: Counts,
     scanned: Vec<bool>,
     visited: FxHashSet<NameId>,
     nat: Option<NameId>,
@@ -76,8 +87,8 @@ impl<'a, W: Write> Exporter<'a, W> {
     pub fn new(env: &'a Env, out: W) -> Self {
         let mut names = vec![UNSEEN; env.names.bound()];
         let mut levels = vec![UNSEEN; env.levels.bound()];
-        names[ANON as usize] = 0;
-        levels[ZERO as usize] = 0;
+        names[ANON.index()] = 0;
+        levels[ZERO.index()] = 0;
         let find = |s| env.find_name(s);
         Self {
             env,
@@ -85,7 +96,11 @@ impl<'a, W: Write> Exporter<'a, W> {
             names,
             levels,
             exprs: vec![UNSEEN; env.exprs.bound()],
-            next: [1, 1, 0],
+            next: Counts {
+                names: 1,
+                levels: 1,
+                exprs: 0,
+            },
             scanned: vec![false; env.exprs.bound()],
             visited: FxHashSet::default(),
             nat: find("Nat"),
@@ -101,7 +116,7 @@ impl<'a, W: Write> Exporter<'a, W> {
         }
     }
 
-    pub fn meta(&mut self) -> io::Result<()> {
+    pub fn meta(&mut self) -> Result<()> {
         let h = &self.env.header;
         writeln!(
             self.out,
@@ -109,21 +124,21 @@ impl<'a, W: Write> Exporter<'a, W> {
             env!("CARGO_PKG_VERSION"),
             h.githash,
             h.version
-        )
+        )?;
+        Ok(())
     }
 
     /// Export every non-internal constant in load order, like `lean4export` with no `--`.
-    pub fn all(&mut self) -> io::Result<()> {
+    pub fn all(&mut self) -> Result<()> {
         self.env.roots().try_for_each(|c| self.constant(c))
     }
 
-    /// Lines written so far for names, levels and expressions.
     #[must_use]
-    pub const fn counts(&self) -> [u32; 3] {
+    pub const fn counts(&self) -> Counts {
         self.next
     }
 
-    pub fn finish(mut self) -> io::Result<W> {
+    pub fn finish(mut self) -> Result<W> {
         self.out.flush()?;
         Ok(self.out)
     }
@@ -133,59 +148,57 @@ impl<'a, W: Write> Exporter<'a, W> {
         &mut self.buf
     }
 
-    fn emit(&mut self) -> io::Result<()> {
+    fn emit(&mut self) -> Result<()> {
         self.buf.0.push(b'\n');
-        self.out.write_all(&self.buf.0)
+        self.out.write_all(&self.buf.0)?;
+        Ok(())
     }
 
-    fn line(&mut self, s: &str) -> io::Result<()> {
+    fn line(&mut self, s: &str) -> Result<()> {
         self.out.write_all(s.as_bytes())?;
-        self.out.write_all(b"\n")
+        self.out.write_all(b"\n")?;
+        Ok(())
     }
 
-    const fn fresh(&mut self, table: usize) -> u32 {
-        let id = self.next[table];
-        self.next[table] += 1;
-        id
-    }
-
-    fn name(&mut self, n: NameId) -> io::Result<u32> {
-        if self.names[n as usize] != UNSEEN {
-            return Ok(self.names[n as usize]);
+    fn name(&mut self, n: NameId) -> Result<u32> {
+        if self.names[n.index()] != UNSEEN {
+            return Ok(self.names[n.index()]);
         }
-        match &self.env.names[n] {
+        let id = match &self.env.names[n] {
             Name::Anon => unreachable!(),
             Name::Str(p, s) => {
                 let p = self.name(*p)?;
-                let id = self.fresh(0);
+                let id = fresh(&mut self.next.names);
                 self.start()
                     .s(r#"{"in":"#)
                     .n(id)
                     .s(r#","str":{"pre":"#)
                     .n(p);
                 self.buf.s(r#","str":"#).q(s).s("}}");
+                id
             }
             Name::Num(p, i) => {
                 let p = self.name(*p)?;
-                let id = self.fresh(0);
+                let id = fresh(&mut self.next.names);
                 self.start().s(r#"{"in":"#).n(id).s(r#","num":{"i":"#).n(*i);
                 self.buf.s(r#","pre":"#).n(p).s("}}");
+                id
             }
-        }
+        };
         self.emit()?;
-        self.names[n as usize] = self.next[0] - 1;
-        Ok(self.next[0] - 1)
+        self.names[n.index()] = id;
+        Ok(id)
     }
 
-    fn name_list(&mut self, ns: &[NameId]) -> io::Result<String> {
+    fn name_list(&mut self, ns: &[NameId]) -> Result<String> {
         let ids = ns
             .iter()
             .map(|&n| self.name(n))
-            .collect::<io::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         Ok(json_list(&ids))
     }
 
-    fn level_params(&mut self, ps: &[NameId]) -> io::Result<String> {
+    fn level_params(&mut self, ps: &[NameId]) -> Result<String> {
         let list = self.name_list(ps)?;
         for &p in ps {
             let l = self
@@ -198,9 +211,9 @@ impl<'a, W: Write> Exporter<'a, W> {
         Ok(list)
     }
 
-    fn level(&mut self, l: LevelId) -> io::Result<u32> {
-        if self.levels[l as usize] != UNSEEN {
-            return Ok(self.levels[l as usize]);
+    fn level(&mut self, l: LevelId) -> Result<u32> {
+        if self.levels[l.index()] != UNSEEN {
+            return Ok(self.levels[l.index()]);
         }
         let (key, a, b) = match self.env.levels[l] {
             Level::Zero => unreachable!(),
@@ -209,7 +222,7 @@ impl<'a, W: Write> Exporter<'a, W> {
             Level::IMax(a, b) => ("imax", self.level(a)?, Some(self.level(b)?)),
             Level::Param(n) => ("param", self.name(n)?, None),
         };
-        let id = self.fresh(1);
+        let id = fresh(&mut self.next.levels);
         let line = self
             .start()
             .s(r#"{"il":"#)
@@ -223,53 +236,57 @@ impl<'a, W: Write> Exporter<'a, W> {
         }
         .s("}");
         self.emit()?;
-        self.levels[l as usize] = id;
+        self.levels[l.index()] = id;
         Ok(id)
     }
 
-    fn expr(&mut self, e: ExprId) -> io::Result<u32> {
-        if self.exprs[e as usize] != UNSEEN {
-            return Ok(self.exprs[e as usize]);
+    fn expr(&mut self, e: ExprId) -> Result<u32> {
+        if self.exprs[e.index()] != UNSEEN {
+            return Ok(self.exprs[e.index()]);
         }
-        match &self.env.exprs[e] {
+        let id = match &self.env.exprs[e] {
             Expr::BVar(i) => {
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"bvar":"#)
                     .n(*i)
                     .s(r#","ie":"#)
                     .n(id)
                     .s("}");
+                id
             }
             Expr::Sort(l) => {
                 let l = self.level(*l)?;
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"ie":"#)
                     .n(id)
                     .s(r#","sort":"#)
                     .n(l)
                     .s("}");
+                id
             }
             Expr::Const(n, us) => {
                 let n = self.name(*n)?;
                 let us = us
                     .iter()
                     .map(|&u| self.level(u))
-                    .collect::<io::Result<Vec<_>>>()?;
-                let id = self.fresh(2);
+                    .collect::<Result<Vec<_>>>()?;
+                let id = fresh(&mut self.next.exprs);
                 self.start().s(r#"{"const":{"name":"#).n(n).s(r#","us":"#);
                 self.buf.list(&us).s(r#"},"ie":"#).n(id).s("}");
+                id
             }
             Expr::App(f, a) => {
                 let (f, a) = (self.expr(*f)?, self.expr(*a)?);
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start().s(r#"{"app":{"arg":"#).n(a).s(r#","fn":"#).n(f);
                 self.buf.s(r#"},"ie":"#).n(id).s("}");
+                id
             }
             Expr::Lam(n, t, b, bi) | Expr::Pi(n, t, b, bi) => {
                 let (n, t, b) = (self.name(*n)?, self.expr(*t)?, self.expr(*b)?);
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 let lam = matches!(self.env.exprs[e], Expr::Lam(..));
                 let line = self.start();
                 if lam {
@@ -287,6 +304,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 } else {
                     line.s(r#","ie":"#).n(id).s("}");
                 }
+                id
             }
             Expr::Let(n, t, v, b) => {
                 let (n, t, v, b) = (
@@ -295,7 +313,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                     self.expr(*v)?,
                     self.expr(*b)?,
                 );
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"ie":"#)
                     .n(id)
@@ -309,34 +327,37 @@ impl<'a, W: Write> Exporter<'a, W> {
                     .s(r#","nondep":false,"type":"#)
                     .n(t);
                 self.buf.s(r#","value":"#).n(v).s("}}");
+                id
             }
             Expr::Nat(v) => {
                 if let Some(nat) = self.nat {
                     self.constant(nat)?;
                 }
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"ie":"#)
                     .n(id)
                     .s(r#","natVal":""#)
                     .s(v)
                     .s(r#""}"#);
+                id
             }
             Expr::Str(v) => {
                 for c in self.str_deps.into_iter().flatten() {
                     self.constant(c)?;
                 }
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"ie":"#)
                     .n(id)
                     .s(r#","strVal":"#)
                     .q(v)
                     .s("}");
+                id
             }
             Expr::Proj(n, i, x) => {
                 let (n, x) = (self.name(*n)?, self.expr(*x)?);
-                let id = self.fresh(2);
+                let id = fresh(&mut self.next.exprs);
                 self.start()
                     .s(r#"{"ie":"#)
                     .n(id)
@@ -348,15 +369,16 @@ impl<'a, W: Write> Exporter<'a, W> {
                     .s(r#","typeName":"#)
                     .n(n)
                     .s("}}");
+                id
             }
-        }
+        };
         self.emit()?;
-        self.exprs[e as usize] = self.next[2] - 1;
-        Ok(self.next[2] - 1)
+        self.exprs[e.index()] = id;
+        Ok(id)
     }
 
-    fn deps(&mut self, e: ExprId) -> io::Result<()> {
-        if self.scanned[e as usize] {
+    fn deps(&mut self, e: ExprId) -> Result<()> {
+        if self.scanned[e.index()] {
             return Ok(());
         }
         match &self.env.exprs[e] {
@@ -373,12 +395,12 @@ impl<'a, W: Write> Exporter<'a, W> {
             Expr::Proj(_, _, x) => self.deps(*x)?,
             Expr::BVar(_) | Expr::Sort(_) | Expr::Nat(_) | Expr::Str(_) => {}
         }
-        self.scanned[e as usize] = true;
+        self.scanned[e.index()] = true;
         Ok(())
     }
 
     /// Export a constant and, first, everything it mentions.
-    pub fn constant(&mut self, c: NameId) -> io::Result<()> {
+    pub fn constant(&mut self, c: NameId) -> Result<()> {
         if !self.visited.insert(c) {
             return Ok(());
         }
@@ -394,13 +416,13 @@ impl<'a, W: Write> Exporter<'a, W> {
                     r#"{{"axiom":{{"isUnsafe":false,"levelParams":{lp},"name":{n},"type":{t}}}}}"#
                 ))
             }
-            Kind::Defn { value, hints, all } => {
+            Kind::Defn(d) => {
                 self.deps(k.ty)?;
-                self.deps(*value)?;
+                self.deps(d.value)?;
                 let (n, lp, t) = self.header(k)?;
-                let v = self.expr(*value)?;
-                let all = self.name_list(all)?;
-                let hints = match hints {
+                let v = self.expr(d.value)?;
+                let all = self.name_list(&d.all)?;
+                let hints = match d.hints {
                     Hints::Opaque => r#""opaque""#.to_owned(),
                     Hints::Abbrev => r#""abbrev""#.to_owned(),
                     Hints::Regular(h) => format!(r#"{{"regular":{h}}}"#),
@@ -409,13 +431,13 @@ impl<'a, W: Write> Exporter<'a, W> {
                     r#"{{"def":{{"all":{all},"hints":{hints},"levelParams":{lp},"name":{n},"safety":"safe","type":{t},"value":{v}}}}}"#
                 ))
             }
-            Kind::Thm { value, all } | Kind::Opaque { value, all } => {
+            Kind::Thm(b) | Kind::Opaque(b) => {
                 self.deps(k.ty)?;
-                self.deps(*value)?;
+                self.deps(b.value)?;
                 let (n, lp, t) = self.header(k)?;
-                let v = self.expr(*value)?;
-                let all = self.name_list(all)?;
-                if matches!(k.kind, Kind::Thm { .. }) {
+                let v = self.expr(b.value)?;
+                let all = self.name_list(&b.all)?;
+                if matches!(k.kind, Kind::Thm(_)) {
                     self.line(&format!(r#"{{"thm":{{"all":{all},"levelParams":{lp},"name":{n},"type":{t},"value":{v}}}}}"#))
                 } else {
                     self.line(&format!(
@@ -424,13 +446,13 @@ impl<'a, W: Write> Exporter<'a, W> {
                 }
             }
             Kind::Quot(_) => self.quot(),
-            Kind::Induct { .. } => self.inductive(k),
-            Kind::Ctor { induct, .. } => self.constant(*induct),
-            Kind::Rec { all, .. } => all.iter().try_for_each(|&i| self.constant(i)),
+            Kind::Induct(ind) => self.inductive(k, ind),
+            Kind::Ctor(ctor) => self.constant(ctor.induct),
+            Kind::Rec(rec) => rec.all.iter().try_for_each(|&i| self.constant(i)),
         }
     }
 
-    fn header(&mut self, k: &Const) -> io::Result<(u32, String, u32)> {
+    fn header(&mut self, k: &Const) -> Result<(u32, String, u32)> {
         Ok((
             self.name(k.name)?,
             self.level_params(&k.level_params)?,
@@ -438,17 +460,18 @@ impl<'a, W: Write> Exporter<'a, W> {
         ))
     }
 
-    fn quot(&mut self) -> io::Result<()> {
+    fn quot(&mut self) -> Result<()> {
+        let env = self.env;
         let [eq, rest @ ..] = self.quot;
         if let Some(eq) = eq {
             self.constant(eq)?;
         }
         for c in rest.into_iter().flatten() {
             self.visited.insert(c);
-            let k = &self.env.consts[&c];
-            let Kind::Quot(kind) = k.kind else {
-                unreachable!()
-            };
+            let (k, kind) = lookup(env, c, "quotient", |k| match k {
+                Kind::Quot(q) => Some(q),
+                _ => None,
+            })?;
             let (n, lp, t) = self.header(k)?;
             let kind = match kind {
                 QuotKind::Type => "type",
@@ -463,55 +486,62 @@ impl<'a, W: Write> Exporter<'a, W> {
         Ok(())
     }
 
-    fn inductive(&mut self, base: &Const) -> io::Result<()> {
+    fn inductive(&mut self, base: &Const, ind: &Inductive) -> Result<()> {
         let env = self.env;
-        let Kind::Induct { all, .. } = &base.kind else {
-            unreachable!()
-        };
-        let types: Vec<&Const> = all.iter().map(|n| &env.consts[n]).collect();
+        let types = ind
+            .all
+            .iter()
+            .map(|&n| {
+                lookup(env, n, "inductive", |k| match k {
+                    Kind::Induct(i) => Some(i),
+                    _ => None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut ctors = Vec::new();
-        for t in &types {
-            let Kind::Induct { ctors: cs, .. } = &t.kind else {
-                unreachable!()
-            };
-            ctors.extend(cs.iter().map(|c| &env.consts[c]));
+        for &(t, i) in &types {
+            for &c in &i.ctors {
+                ctors.push(lookup(env, c, "constructor", |k| match k {
+                    Kind::Ctor(c) => Some(c),
+                    _ => None,
+                })?);
+            }
             self.visited.insert(t.name);
             self.deps(t.ty)?;
         }
-        for c in &ctors {
+        for &(c, _) in &ctors {
             self.visited.insert(c.name);
             self.deps(c.ty)?;
         }
-        let recs: Vec<&Const> = env
+        let recs = env
             .recursors
             .get(&base.name)
             .map_or(&[][..], Vec::as_slice)
             .iter()
-            .map(|r| &env.consts[r])
-            .collect();
-        for r in &recs {
+            .map(|&r| {
+                lookup(env, r, "recursor", |k| match k {
+                    Kind::Rec(r) => Some(r),
+                    _ => None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for &(r, _) in &recs {
             self.visited.insert(r.name);
             self.deps(r.ty)?;
         }
-        for r in &recs {
-            let Kind::Rec { rules, .. } = &r.kind else {
-                unreachable!()
-            };
-            for rule in rules {
+        for (_, rec) in &recs {
+            for rule in &rec.rules {
                 self.deps(rule.rhs)?;
             }
         }
         let mut out = String::from(r#"{"inductive":{"ctors":["#);
-        for (i, c) in ctors.iter().enumerate() {
-            let Kind::Ctor {
+        for (i, &(c, ctor)) in ctors.iter().enumerate() {
+            let Ctor {
                 induct,
                 cidx,
                 num_params,
                 num_fields,
-            } = c.kind
-            else {
-                unreachable!()
-            };
+            } = *ctor;
             let (n, lp, t) = self.header(c)?;
             let induct = self.name(induct)?;
             sep(&mut out, i);
@@ -521,8 +551,8 @@ impl<'a, W: Write> Exporter<'a, W> {
             );
         }
         out.push_str(r#"],"recs":["#);
-        for (i, r) in recs.iter().enumerate() {
-            let Kind::Rec {
+        for (i, &(r, rec)) in recs.iter().enumerate() {
+            let Rec {
                 all,
                 num_params,
                 num_indices,
@@ -530,10 +560,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 num_minors,
                 rules,
                 k,
-            } = &r.kind
-            else {
-                unreachable!()
-            };
+            } = rec;
             let (n, lp, t) = self.header(r)?;
             let all = self.name_list(all)?;
             let mut rs = String::new();
@@ -553,8 +580,8 @@ impl<'a, W: Write> Exporter<'a, W> {
             );
         }
         out.push_str(r#"],"types":["#);
-        for (i, ty) in types.iter().enumerate() {
-            let Kind::Induct {
+        for (i, &(ty, ind)) in types.iter().enumerate() {
+            let Inductive {
                 num_params,
                 num_indices,
                 all,
@@ -562,10 +589,7 @@ impl<'a, W: Write> Exporter<'a, W> {
                 num_nested,
                 is_rec,
                 is_reflexive,
-            } = &ty.kind
-            else {
-                unreachable!()
-            };
+            } = ind;
             let (n, lp, t) = self.header(ty)?;
             let (all, ctors) = (self.name_list(all)?, self.name_list(ctors)?);
             sep(&mut out, i);
@@ -577,6 +601,25 @@ impl<'a, W: Write> Exporter<'a, W> {
         out.push_str("]}}");
         self.line(&out)
     }
+}
+
+/// The constant `n` and the part of its kind that `pick` selects, or an error saying it is
+/// not the `what` the referring constant claims.
+fn lookup<'e, T>(
+    env: &'e Env,
+    n: NameId,
+    what: &str,
+    pick: impl Fn(&'e Kind) -> Option<&'e T>,
+) -> Result<(&'e Const, &'e T)> {
+    env.consts
+        .get(&n)
+        .and_then(|c| Some((c, pick(&c.kind)?)))
+        .ok_or_else(|| corrupt(format!("{} is not a known {what}", env.display(n))))
+}
+
+const fn fresh(next: &mut u32) -> u32 {
+    *next += 1;
+    *next - 1
 }
 
 const fn binder(b: Binder) -> &'static str {

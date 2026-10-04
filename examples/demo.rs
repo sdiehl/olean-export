@@ -1,9 +1,9 @@
 #![allow(clippy::many_single_char_names)]
 
-use olean_export::{Env, Expr, Kind, Level};
+use olean_export::{Env, Expr, ExprId, Kind, Level, LevelId, NameId};
 use std::path::PathBuf;
 
-fn level(env: &Env, l: u32) -> String {
+fn level(env: &Env, l: LevelId) -> String {
     match env.levels[l] {
         Level::Zero => "0".into(),
         Level::Succ(a) => format!("{}+1", level(env, a)),
@@ -13,7 +13,7 @@ fn level(env: &Env, l: u32) -> String {
     }
 }
 
-fn sort(env: &Env, l: u32) -> String {
+fn sort(env: &Env, l: LevelId) -> String {
     match env.levels[l] {
         Level::Zero => "Prop".into(),
         Level::Succ(a) if env.levels[a] == Level::Zero => "Type".into(),
@@ -22,13 +22,13 @@ fn sort(env: &Env, l: u32) -> String {
     }
 }
 
-fn binder(env: &Env, n: u32, depth: usize) -> String {
+fn binder(env: &Env, n: NameId, depth: usize) -> String {
     let s = env.display(n);
     let s = s.split("._@").next().unwrap_or_default();
     format!("{s}{depth}")
 }
 
-fn expr(env: &Env, e: u32, ctx: &mut Vec<String>) -> String {
+fn expr(env: &Env, e: ExprId, ctx: &mut Vec<String>) -> String {
     match &env.exprs[e] {
         Expr::BVar(i) => ctx[ctx.len() - 1 - usize::try_from(*i).unwrap()].clone(),
         Expr::Sort(l) => sort(env, *l),
@@ -90,14 +90,16 @@ fn main() {
         let k = &env.consts[&env.find_name(name).unwrap()];
         let ty = expr(&env, k.ty, &mut Vec::new());
         match &k.kind {
-            Kind::Defn { value, .. } | Kind::Thm { value, .. } => {
-                println!(
-                    "{name} : {ty}\n  := {}\n",
-                    expr(&env, *value, &mut Vec::new())
-                );
-            }
-            Kind::Induct { ctors, .. } => {
-                let cs: Vec<String> = ctors.iter().map(|&c| env.display(c)).collect();
+            Kind::Defn(d) => println!(
+                "{name} : {ty}\n  := {}\n",
+                expr(&env, d.value, &mut Vec::new())
+            ),
+            Kind::Thm(b) => println!(
+                "{name} : {ty}\n  := {}\n",
+                expr(&env, b.value, &mut Vec::new())
+            ),
+            Kind::Induct(ind) => {
+                let cs: Vec<String> = ind.ctors.iter().map(|&c| env.display(c)).collect();
                 println!("{name} : {ty}\n  ctors {}\n", cs.join(", "));
             }
             _ => println!("{name} : {ty}\n"),

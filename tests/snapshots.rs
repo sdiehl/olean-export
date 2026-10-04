@@ -36,7 +36,7 @@ fn damaged() {
         std::fs::write(dir.join("Top.olean"), bytes).unwrap();
         let err = Env::load(std::slice::from_ref(&dir), &["Top"]).unwrap_err();
         let msg = err.to_string().replace(dir.to_str().unwrap(), "$DIR");
-        writeln!(out, "{name}: {:?}: {msg}", err.kind()).unwrap();
+        writeln!(out, "{name}: {msg}").unwrap();
     }
     std::fs::remove_dir_all(&dir).unwrap();
     insta::assert_snapshot!(out);

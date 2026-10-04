@@ -11,24 +11,29 @@
 )]
 
 mod env;
+mod error;
 mod export;
 mod olean;
 
 pub use env::{
-    search_path, Binder, Const, Env, Expr, ExprId, Exprs, Hints, Kind, Level, LevelId, Name,
-    NameId, QuotKind, Rule, Table, ANON, ZERO,
+    search_path, Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Exprs, Hints, Id, Inductive,
+    Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Rule, Table, ANON, ZERO,
 };
-pub use export::Exporter;
+pub use error::{Error, Result};
+pub use export::{Counts, Exporter};
 pub use olean::{Header, SUPPORTED};
 
 const STACK: usize = 1 << 30;
 
-/// Run `f` on a thread with a stack deep enough for long application spines and binder chains.
-pub fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::Builder::new()
-        .stack_size(STACK)
-        .spawn(f)
-        .expect("spawn")
-        .join()
-        .expect("worker panicked")
+/// Run `f` on a thread with a stack deep enough for long application spines and binder chains,
+/// re-raising its panic if it has one. [`Exporter`] recurses over terms, so run it inside this.
+pub fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
 }

@@ -2,13 +2,13 @@
 name = "olean-export"
 version = "0.1.0"
 authors = ["Stephen Diehl <stephen.m.diehl@gmail.com>"]
-categories = ["mathematics", "parser-implementations", "command-line-utilities"]
+categories = ["mathematics", "lean", "lean4"]
 edition = "2021"
 keywords = ["lean", "lean4", "olean", "theorem-prover", "kernel"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/sdiehl/olean-export"
-description = "Read Lean 4 .olean files directly in Rust and emit the lean4export NDJSON stream for external kernel checkers."
+description = "Optimized library for reading Lean .olean files directly emitting lean4export-compatible NDJSON for external kernel checkers."
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
@@ -19,6 +19,7 @@ memmap2 = "0.9.11"
 parking_lot = "0.12.5"
 rayon = "1.12.0"
 rustc-hash = "2"
+thiserror = "2"
 
 [[example]]
 name = "demo"

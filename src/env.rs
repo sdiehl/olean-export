@@ -1,11 +1,15 @@
-use crate::olean::{at, corrupt, is_scalar, small_nat, Header, Image};
+use crate::{
+    error::{at, corrupt, Error, Result},
+    olean::{is_scalar, small_nat, Header, Image},
+};
 use hashbrown::{hash_table::Entry, HashTable};
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
+    fmt,
     hash::{BuildHasher, Hash},
-    io,
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -13,12 +17,42 @@ use std::{
     },
 };
 
-pub type NameId = u32;
-pub type LevelId = u32;
-pub type ExprId = u32;
+/// The id of a `T` in its table.
+#[derive(PartialEq, Eq, Hash)]
+pub struct Id<T>(u32, PhantomData<fn() -> T>);
 
-pub const ANON: NameId = 0;
-pub const ZERO: LevelId = 0;
+impl<T> Id<T> {
+    const fn new(i: u32) -> Self {
+        Self(i, PhantomData)
+    }
+
+    /// The id as an index, for arrays sized by a table's `bound`.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl<T> Clone for Id<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Id<T> {}
+
+impl<T> fmt::Debug for Id<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+pub type NameId = Id<Name>;
+pub type LevelId = Id<Level>;
+pub type ExprId = Id<Expr>;
+
+pub const ANON: NameId = Id::new(0);
+pub const ZERO: LevelId = Id::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Name {
@@ -84,20 +118,20 @@ impl Hash for Expr {
         let pack = |a: u32, b: u32| u64::from(a) << 32 | u64::from(b);
         match self {
             Self::BVar(i) => h.write_u64(*i),
-            Self::Sort(l) => h.write_u32(*l),
+            Self::Sort(l) => h.write_u32(l.0),
             Self::Const(n, us) => {
-                h.write_u32(*n);
-                us.iter().for_each(|&u| h.write_u32(u));
+                h.write_u32(n.0);
+                us.iter().for_each(|u| h.write_u32(u.0));
             }
-            Self::App(f, a) => h.write_u64(pack(*f, *a)),
-            Self::Lam(_, t, b, _) | Self::Pi(_, t, b, _) => h.write_u64(pack(*t, *b)),
+            Self::App(f, a) => h.write_u64(pack(f.0, a.0)),
+            Self::Lam(_, t, b, _) | Self::Pi(_, t, b, _) => h.write_u64(pack(t.0, b.0)),
             Self::Let(_, t, v, b) => {
-                h.write_u64(pack(*t, *v));
-                h.write_u32(*b);
+                h.write_u64(pack(t.0, v.0));
+                h.write_u32(b.0);
             }
             Self::Nat(v) | Self::Str(v) => h.write(v.as_bytes()),
             Self::Proj(n, i, x) => {
-                h.write_u64(pack(*n, *x));
+                h.write_u64(pack(n.0, x.0));
                 h.write_u64(*i);
             }
         }
@@ -145,46 +179,59 @@ pub struct Rule {
 }
 
 #[derive(Debug)]
+pub struct Defn {
+    pub value: ExprId,
+    pub hints: Hints,
+    pub all: Vec<NameId>,
+}
+
+/// The value of a theorem or opaque constant.
+#[derive(Debug)]
+pub struct Body {
+    pub value: ExprId,
+    pub all: Vec<NameId>,
+}
+
+#[derive(Debug)]
+pub struct Inductive {
+    pub num_params: u64,
+    pub num_indices: u64,
+    pub all: Vec<NameId>,
+    pub ctors: Vec<NameId>,
+    pub num_nested: u64,
+    pub is_rec: bool,
+    pub is_reflexive: bool,
+}
+
+#[derive(Debug)]
+pub struct Ctor {
+    pub induct: NameId,
+    pub cidx: u64,
+    pub num_params: u64,
+    pub num_fields: u64,
+}
+
+#[derive(Debug)]
+pub struct Rec {
+    pub all: Vec<NameId>,
+    pub num_params: u64,
+    pub num_indices: u64,
+    pub num_motives: u64,
+    pub num_minors: u64,
+    pub rules: Vec<Rule>,
+    pub k: bool,
+}
+
+#[derive(Debug)]
 pub enum Kind {
     Axiom,
-    Defn {
-        value: ExprId,
-        hints: Hints,
-        all: Vec<NameId>,
-    },
-    Thm {
-        value: ExprId,
-        all: Vec<NameId>,
-    },
-    Opaque {
-        value: ExprId,
-        all: Vec<NameId>,
-    },
+    Defn(Defn),
+    Thm(Body),
+    Opaque(Body),
     Quot(QuotKind),
-    Induct {
-        num_params: u64,
-        num_indices: u64,
-        all: Vec<NameId>,
-        ctors: Vec<NameId>,
-        num_nested: u64,
-        is_rec: bool,
-        is_reflexive: bool,
-    },
-    Ctor {
-        induct: NameId,
-        cidx: u64,
-        num_params: u64,
-        num_fields: u64,
-    },
-    Rec {
-        all: Vec<NameId>,
-        num_params: u64,
-        num_indices: u64,
-        num_motives: u64,
-        num_minors: u64,
-        rules: Vec<Rule>,
-        k: bool,
-    },
+    Induct(Inductive),
+    Ctor(Ctor),
+    Rec(Rec),
 }
 
 /// A declaration the kernel would accept. Unsafe and partial ones are dropped at load time.
@@ -237,7 +284,7 @@ impl<T: Hash + Eq> Shared<T> {
         Self(shards.into_iter().map(Mutex::new).collect())
     }
 
-    fn intern(&self, t: T) -> u32 {
+    fn intern(&self, t: T) -> Id<T> {
         let h = hash(&t);
         let k = shard_of(h);
         let mut g = self.0[k].lock();
@@ -256,7 +303,7 @@ impl<T: Hash + Eq> Shared<T> {
             }
         };
         drop(g);
-        id(i * SHARDS + k)
+        Id::new(id(i * SHARDS + k))
     }
 
     fn freeze(self) -> Table<T> {
@@ -270,12 +317,12 @@ impl<T: Hash + Eq> Shared<T> {
 pub struct Table<T>(Vec<Shard<T>>);
 
 impl<T: Hash + Eq> Table<T> {
-    pub fn get(&self, t: &T) -> Option<u32> {
+    pub fn get(&self, t: &T) -> Option<Id<T>> {
         let h = hash(t);
         let k = shard_of(h);
         let s = &self.0[k];
         let i = s.index.find(h, |&i| s.nodes[i as usize] == *t)?;
-        Some(id(*i as usize * SHARDS + k))
+        Some(Id::new(id(*i as usize * SHARDS + k)))
     }
 
     /// The number of nodes.
@@ -296,10 +343,10 @@ impl<T: Hash + Eq> Table<T> {
     }
 }
 
-impl<T> std::ops::Index<u32> for Table<T> {
+impl<T> std::ops::Index<Id<T>> for Table<T> {
     type Output = T;
-    fn index(&self, i: u32) -> &T {
-        let i = i as usize;
+    fn index(&self, i: Id<T>) -> &T {
+        let i = i.index();
         &self.0[i % SHARDS].nodes[i / SHARDS]
     }
 }
@@ -341,37 +388,32 @@ impl SharedExprs {
             .lock()
     }
 
+    /// Run `f` on node `i` and its rank.
+    fn with<R>(&self, i: u32, f: impl FnOnce(&mut Expr, &mut u32) -> R) -> R {
+        let i = i as usize;
+        let mut g = self.chunk(i / CHUNK);
+        let c = &mut *g;
+        let r = f(&mut c.nodes[i % CHUNK], &mut c.ranks[i % CHUNK]);
+        drop(g);
+        r
+    }
+
     /// Intern `e` from module `rank`, adding it to the chunk `cursor` if it is new.
     #[allow(clippy::significant_drop_tightening)]
-    fn intern(&self, e: Expr, rank: u32, cursor: &mut Option<usize>) -> u32 {
+    fn intern(&self, e: Expr, rank: u32, cursor: &mut Option<usize>) -> ExprId {
         let h = hash(&e);
         let mut index = self.index[shard_of(h)].lock();
-        let node = |i: u32, f: &mut dyn FnMut(&mut Expr, &mut u32)| {
-            let i = i as usize;
-            let mut g = self.chunk(i / CHUNK);
-            let c = &mut *g;
-            f(&mut c.nodes[i % CHUNK], &mut c.ranks[i % CHUNK]);
-            drop(g);
-        };
         let entry = index.entry(
             h,
-            |&i| {
-                let mut eq = false;
-                node(i, &mut |n, _| eq = *n == e);
-                eq
-            },
-            |&i| {
-                let mut h = 0;
-                node(i, &mut |n, _| h = hash(n));
-                h
-            },
+            |&i| self.with(i, |n, _| *n == e),
+            |&i| self.with(i, |n, _| hash(n)),
         );
-        match entry {
+        let i = match entry {
             Entry::Occupied(o) => {
                 let i = *o.get();
-                node(i, &mut |n, r| {
+                self.with(i, |n, r| {
                     if rank < *r {
-                        *n = e.clone();
+                        *n = e;
                         *r = rank;
                     }
                 });
@@ -398,7 +440,8 @@ impl SharedExprs {
                 v.insert(i);
                 i
             }
-        }
+        };
+        Id::new(i)
     }
 
     fn freeze(self) -> Exprs {
@@ -434,10 +477,10 @@ impl Exprs {
     }
 }
 
-impl std::ops::Index<u32> for Exprs {
+impl std::ops::Index<ExprId> for Exprs {
     type Output = Expr;
-    fn index(&self, i: u32) -> &Expr {
-        let i = i as usize;
+    fn index(&self, i: ExprId) -> &Expr {
+        let i = i.index();
         &self.0[i / CHUNK][i % CHUNK]
     }
 }
@@ -473,7 +516,7 @@ pub struct Env {
 
 impl Env {
     /// Load `roots` and their transitive imports, resolving modules against `search`.
-    pub fn load(search: &[PathBuf], roots: &[&str]) -> io::Result<Self> {
+    pub fn load(search: &[PathBuf], roots: &[&str]) -> Result<Self> {
         let jobs = std::thread::available_parallelism().map_or(1, usize::from);
         Self::load_with(search, roots, jobs, &|_, _| {})
     }
@@ -488,7 +531,7 @@ impl Env {
         roots: &[&str],
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         let mut seen = FxHashSet::default();
         let mut found = Vec::new();
         for root in roots {
@@ -513,8 +556,7 @@ impl Env {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs.max(1))
             .stack_size(crate::STACK)
-            .build()
-            .map_err(io::Error::other)?;
+            .build()?;
         let (done, consts) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let decoded = pool.install(|| {
             found
@@ -530,7 +572,7 @@ impl Env {
                         Ok(m)
                     },
                 )
-                .collect::<io::Result<Vec<_>>>()
+                .collect::<Result<Vec<_>>>()
         })?;
         let mut env = Self {
             names: tables.names.freeze(),
@@ -595,12 +637,7 @@ impl Env {
     }
 }
 
-fn decode(
-    tables: &Tables,
-    rank: u32,
-    cursor: &mut Option<usize>,
-    path: &Path,
-) -> io::Result<Module> {
+fn decode(tables: &Tables, rank: u32, cursor: &mut Option<usize>, path: &Path) -> Result<Module> {
     let mut img = Image::open(path)?;
     if img.scalar_u8(img.root, 0).map_err(at(path))? == 1 {
         img.push_part(&path.with_extension("olean.server"))?;
@@ -629,7 +666,7 @@ fn discover(
     module: &str,
     seen: &mut FxHashSet<String>,
     out: &mut Vec<(String, PathBuf)>,
-) -> io::Result<()> {
+) -> Result<()> {
     if !seen.insert(module.to_owned()) {
         return Ok(());
     }
@@ -644,22 +681,17 @@ fn discover(
     Ok(())
 }
 
-fn resolve(search: &[PathBuf], module: &str) -> io::Result<PathBuf> {
+fn resolve(search: &[PathBuf], module: &str) -> Result<PathBuf> {
     let rel: PathBuf = module.split('.').collect();
     search
         .iter()
         .map(|dir| dir.join(&rel).with_extension("olean"))
         .find(|p| p.is_file())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("module {module} not found on LEAN_PATH"),
-            )
-        })
+        .ok_or_else(|| Error::ModuleNotFound(module.to_owned()))
 }
 
 impl Image {
-    fn imports(&self) -> io::Result<Vec<String>> {
+    fn imports(&self) -> Result<Vec<String>> {
         let imports = self.array(self.field(self.root, 0)?)?;
         imports
             .into_iter()
@@ -667,7 +699,7 @@ impl Image {
             .collect()
     }
 
-    fn str_name(&self, mut o: u64) -> io::Result<String> {
+    fn str_name(&self, mut o: u64) -> Result<String> {
         let mut parts = Vec::new();
         while !is_scalar(o) && self.tag(o)? != 0 {
             parts.push(if self.tag(o)? == 1 {
@@ -698,7 +730,7 @@ struct Decoder<'a> {
 }
 
 impl Decoder<'_> {
-    fn run(&mut self) -> io::Result<()> {
+    fn run(&mut self) -> Result<()> {
         let img = self.img;
         for c in img.array(img.field(img.root, 2)?)? {
             self.constant(c)?;
@@ -707,17 +739,17 @@ impl Decoder<'_> {
     }
 
     /// The memo slot of `o`, and its id if it was already decoded.
-    fn seen(&self, o: u64) -> io::Result<(usize, Option<u32>)> {
+    fn seen<T>(&self, o: u64) -> Result<(usize, Option<Id<T>>)> {
         let slot = self.img.slot(o)?;
-        Ok((slot, self.memo[slot].checked_sub(1)))
+        Ok((slot, self.memo[slot].checked_sub(1).map(Id::new)))
     }
 
-    fn remember(&mut self, slot: usize, id: u32) -> u32 {
-        self.memo[slot] = id + 1;
+    fn remember<T>(&mut self, slot: usize, id: Id<T>) -> Id<T> {
+        self.memo[slot] = id.0 + 1;
         id
     }
 
-    fn name(&mut self, o: u64) -> io::Result<NameId> {
+    fn name(&mut self, o: u64) -> Result<NameId> {
         let img = self.img;
         if is_scalar(o) || img.tag(o)? == 0 {
             return Ok(ANON);
@@ -736,7 +768,7 @@ impl Decoder<'_> {
         Ok(self.remember(slot, id))
     }
 
-    fn names(&mut self, o: u64) -> io::Result<Vec<NameId>> {
+    fn names(&mut self, o: u64) -> Result<Vec<NameId>> {
         self.img
             .list(o)?
             .into_iter()
@@ -744,7 +776,7 @@ impl Decoder<'_> {
             .collect()
     }
 
-    fn level(&mut self, o: u64) -> io::Result<LevelId> {
+    fn level(&mut self, o: u64) -> Result<LevelId> {
         let img = self.img;
         if is_scalar(o) || img.tag(o)? == 0 {
             return Ok(ZERO);
@@ -765,7 +797,7 @@ impl Decoder<'_> {
         Ok(self.remember(slot, id))
     }
 
-    fn expr(&mut self, o: u64) -> io::Result<ExprId> {
+    fn expr(&mut self, o: u64) -> Result<ExprId> {
         let (slot, seen) = self.seen(o)?;
         if let Some(id) = seen {
             return Ok(id);
@@ -773,7 +805,7 @@ impl Decoder<'_> {
         let img = self.img;
         let f = |i| img.field(o, i);
         let binder = || {
-            Ok::<_, io::Error>(match img.scalar_u8(o, 8)? {
+            Ok::<_, Error>(match img.scalar_u8(o, 8)? {
                 0 => Binder::Default,
                 1 => Binder::Implicit,
                 2 => Binder::StrictImplicit,
@@ -788,7 +820,7 @@ impl Decoder<'_> {
                 let us = us
                     .into_iter()
                     .map(|l| self.level(l))
-                    .collect::<io::Result<_>>()?;
+                    .collect::<Result<_>>()?;
                 Expr::Const(self.name(f(0)?)?, us)
             }
             5 => Expr::App(self.expr(f(0)?)?, self.expr(f(1)?)?),
@@ -834,7 +866,7 @@ impl Decoder<'_> {
         Ok(self.remember(slot, id))
     }
 
-    fn constant(&mut self, info: u64) -> io::Result<()> {
+    fn constant(&mut self, info: u64) -> Result<()> {
         let img = self.img;
         let tag = img.tag(info)?;
         let val = img.field(info, 0)?;
@@ -868,27 +900,27 @@ impl Decoder<'_> {
                 } else {
                     Hints::Abbrev
                 };
-                Kind::Defn {
+                Kind::Defn(Defn {
                     value: self.expr(f(1)?)?,
                     hints,
                     all: self.names(f(3)?)?,
-                }
+                })
             }
-            2 => Kind::Thm {
+            2 => Kind::Thm(Body {
                 value: self.expr(f(1)?)?,
                 all: self.names(f(2)?)?,
-            },
-            3 => Kind::Opaque {
+            }),
+            3 => Kind::Opaque(Body {
                 value: self.expr(f(1)?)?,
                 all: self.names(f(2)?)?,
-            },
+            }),
             4 => Kind::Quot(match img.scalar_u8(val, 0)? {
                 0 => QuotKind::Type,
                 1 => QuotKind::Ctor,
                 2 => QuotKind::Lift,
                 _ => QuotKind::Ind,
             }),
-            5 => Kind::Induct {
+            5 => Kind::Induct(Inductive {
                 num_params: nat(1)?,
                 num_indices: nat(2)?,
                 all: self.names(f(3)?)?,
@@ -896,13 +928,13 @@ impl Decoder<'_> {
                 num_nested: nat(5)?,
                 is_rec: img.scalar_u8(val, 0)? != 0,
                 is_reflexive: img.scalar_u8(val, 2)? != 0,
-            },
-            6 => Kind::Ctor {
+            }),
+            6 => Kind::Ctor(Ctor {
                 induct: self.name(f(1)?)?,
                 cidx: nat(2)?,
                 num_params: nat(3)?,
                 num_fields: nat(4)?,
-            },
+            }),
             7 => {
                 let all = self.names(f(1)?)?;
                 for &ind in &all {
@@ -916,7 +948,7 @@ impl Decoder<'_> {
                         rhs: self.expr(img.field(r, 2)?)?,
                     });
                 }
-                Kind::Rec {
+                Kind::Rec(Rec {
                     all,
                     num_params: nat(2)?,
                     num_indices: nat(3)?,
@@ -924,7 +956,7 @@ impl Decoder<'_> {
                     num_minors: nat(5)?,
                     rules,
                     k: img.scalar_u8(val, 0)? != 0,
-                }
+                })
             }
             t => return Err(corrupt(format!("unexpected constant tag {t}"))),
         };
