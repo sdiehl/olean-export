@@ -74,8 +74,8 @@ impl Line {
 
 impl<'a, W: Write> Exporter<'a, W> {
     pub fn new(env: &'a Env, out: W) -> Self {
-        let mut names = vec![UNSEEN; env.names.len()];
-        let mut levels = vec![UNSEEN; env.levels.len()];
+        let mut names = vec![UNSEEN; env.names.bound()];
+        let mut levels = vec![UNSEEN; env.levels.bound()];
         names[ANON as usize] = 0;
         levels[ZERO as usize] = 0;
         let find = |s| env.find_name(s);
@@ -84,9 +84,9 @@ impl<'a, W: Write> Exporter<'a, W> {
             out,
             names,
             levels,
-            exprs: vec![UNSEEN; env.exprs.len()],
+            exprs: vec![UNSEEN; env.exprs.bound()],
             next: [1, 1, 0],
-            scanned: vec![false; env.exprs.len()],
+            scanned: vec![false; env.exprs.bound()],
             visited: FxHashSet::default(),
             nat: find("Nat"),
             str_deps: [find("Char.ofNat"), find("String.ofList")],
@@ -304,6 +304,8 @@ impl<'a, W: Write> Exporter<'a, W> {
                 self.buf
                     .s(r#","name":"#)
                     .n(n)
+                    // Lean marks most `let`s nondep, but lean4export writes false for all of
+                    // them so that terms differing only in the flag share one index.
                     .s(r#","nondep":false,"type":"#)
                     .n(t);
                 self.buf.s(r#","value":"#).n(v).s("}}");

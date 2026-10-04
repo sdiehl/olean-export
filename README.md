@@ -1,10 +1,10 @@
 # tiny-olean
 
-Rust library to read Lean 4 `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
+Rust library to read Lean `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
 
 The big idea is an `.olean` is already a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But much faster.
 
-The object layout is tied to the Lean release. This version targets olean format v2 as written by Lean 4.34 and 4.35.
+The object layout is tied to the Lean release. This version reads olean format v2 as written by Lean 4.26 through 4.35, and refuses files from any other release rather than risk decoding them wrong. Damaged files produce an error, not a panic.
 
 ```bash
 cargo build --release
@@ -47,15 +47,15 @@ Wall time:
 
 | Target                    | lean4export | tiny-olean | Speedup |
 | ------------------------- | ----------- | ---------- | ------- |
-| Small model on `Lean`     | 18.3s       | 1.6s       | 11x     |
-| Mathlib-dependent library | 1541s       | 37s        | 42x     |
+| Small model on `Lean`     | 18.3s       | 1.5s       | 12x     |
+| Mathlib-dependent library | 1541s       | 23s        | 67x     |
 
 Peak memory:
 
 | Target                    | lean4export | tiny-olean |
 | ------------------------- | ----------- | ---------- |
-| Small model on `Lean`     | 1.3 GB      | 0.8 GB     |
-| Mathlib-dependent library | 9.4 GB      | 5.3 GB     |
+| Small model on `Lean`     | 1.3 GB      | 0.5 GB     |
+| Mathlib-dependent library | 9.4 GB      | 4.3 GB     |
 
 ## License
 

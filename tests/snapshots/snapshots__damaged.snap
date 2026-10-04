@@ -1,0 +1,7 @@
+---
+source: tests/snapshots.rs
+expression: out
+---
+truncated: InvalidData: $DIR/Top.olean: pointer 0x383339e69e60 is outside the module
+future: InvalidData: $DIR/Top.olean: built by Lean 4.99.0-rc3, but only 4.26 to 4.35 are supported
+garbage: InvalidData: $DIR/Top.olean: not an olean file

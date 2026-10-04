@@ -15,11 +15,11 @@ mod export;
 mod olean;
 
 pub use env::{
-    search_path, Binder, Const, Env, Expr, ExprId, Hints, Kind, Level, LevelId, Name, NameId,
-    QuotKind, Rule, Table, ANON, ZERO,
+    search_path, Binder, Const, Env, Expr, ExprId, Exprs, Hints, Kind, Level, LevelId, Name,
+    NameId, QuotKind, Rule, Table, ANON, ZERO,
 };
 pub use export::Exporter;
-pub use olean::Header;
+pub use olean::{Header, SUPPORTED};
 
 const STACK: usize = 1 << 30;
 

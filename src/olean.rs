@@ -29,11 +29,15 @@ pub(crate) struct Image {
     pub(crate) root: u64,
 }
 
-fn invalid(path: &Path, msg: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("{}: {msg}", path.display()),
-    )
+/// The Lean releases whose object layouts this reader has been checked against.
+pub const SUPPORTED: std::ops::RangeInclusive<u32> = 26..=35;
+
+pub(crate) fn corrupt(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+pub(crate) fn at(path: &Path) -> impl FnOnce(io::Error) -> io::Error + '_ {
+    move |e| io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -52,6 +56,10 @@ impl Image {
     }
 
     pub(crate) fn push_part(&mut self, path: &Path) -> io::Result<()> {
+        self.map(path).map_err(at(path))
+    }
+
+    fn map(&mut self, path: &Path) -> io::Result<()> {
         let file = File::open(path)?;
         // SAFETY: the map is read-only and lives as long as `self`. Rewriting an .olean while
         // it is being read is undefined behaviour, the same assumption Lean makes when it maps them.
@@ -59,20 +67,29 @@ impl Image {
         let bytes = unsafe { MmapOptions::new().populate().map(&file)? };
         bytes.advise(memmap2::Advice::WillNeed)?;
         if bytes.len() < 96 || &bytes[..5] != b"olean" {
-            return Err(invalid(path, "not an olean file"));
+            return Err(corrupt("not an olean file"));
         }
-        let root_at = match bytes[5] {
-            2 => 88,
-            3 => 96,
-            v => return Err(invalid(path, &format!("unsupported olean version {v}"))),
-        };
+        if bytes[5] != 2 {
+            return Err(corrupt(format!("unsupported olean format {}", bytes[5])));
+        }
+        let version = cstr(&bytes[7..40]);
+        let minor = version
+            .strip_prefix("4.")
+            .and_then(|v| v.split('.').next()?.parse().ok());
+        if !minor.is_some_and(|m| SUPPORTED.contains(&m)) {
+            return Err(corrupt(format!(
+                "built by Lean {version}, but only 4.{} to 4.{} are supported",
+                SUPPORTED.start(),
+                SUPPORTED.end()
+            )));
+        }
         self.header = Header {
-            version: cstr(&bytes[7..40]),
+            version,
             githash: cstr(&bytes[40..80]),
             gmp: bytes[6] & 1 == 1,
         };
         let base = le64(&bytes[80..88]);
-        self.root = le64(&bytes[root_at..root_at + 8]);
+        self.root = le64(&bytes[88..96]);
         let slot = self.slots();
         self.parts.push(Part { base, slot, bytes });
         Ok(())
@@ -84,88 +101,96 @@ impl Image {
     }
 
     /// A dense index for the object at `addr`, for memo tables.
-    pub(crate) fn slot(&self, addr: u64) -> usize {
-        for p in &self.parts {
-            if let Some(off) = addr.checked_sub(p.base) {
-                let off = usize::try_from(off).unwrap_or(usize::MAX);
-                if off < p.bytes.len() {
-                    return p.slot + off / 8;
-                }
-            }
-        }
-        panic!("pointer {addr:#x} is outside every region of this module")
+    pub(crate) fn slot(&self, addr: u64) -> io::Result<usize> {
+        self.locate(addr, 8).map(|(p, off)| p.slot + off / 8)
     }
 
-    fn bytes(&self, addr: u64, len: usize) -> &[u8] {
-        for p in &self.parts {
-            if let Some(off) = addr.checked_sub(p.base) {
-                let off = usize::try_from(off).unwrap_or(usize::MAX);
-                if let Some(b) = p.bytes.get(off..off.saturating_add(len)) {
-                    return b;
-                }
-            }
-        }
-        panic!("pointer {addr:#x} is outside every region of this module")
+    fn locate(&self, addr: u64, len: usize) -> io::Result<(&Part, usize)> {
+        self.parts
+            .iter()
+            .find_map(|p| {
+                let off = usize::try_from(addr.checked_sub(p.base)?).ok()?;
+                (off.checked_add(len)? <= p.bytes.len()).then_some((p, off))
+            })
+            .ok_or_else(|| corrupt(format!("pointer {addr:#x} is outside the module")))
     }
 
-    pub(crate) fn u64(&self, addr: u64) -> u64 {
-        le64(self.bytes(addr, 8))
+    fn bytes(&self, addr: u64, len: usize) -> io::Result<&[u8]> {
+        self.locate(addr, len)
+            .map(|(p, off)| &p.bytes[off..off + len])
     }
 
-    pub(crate) fn u8(&self, addr: u64) -> u8 {
-        self.bytes(addr, 1)[0]
+    pub(crate) fn u64(&self, addr: u64) -> io::Result<u64> {
+        self.bytes(addr, 8).map(le64)
     }
 
-    pub(crate) fn tag(&self, o: u64) -> u8 {
+    pub(crate) fn u8(&self, addr: u64) -> io::Result<u8> {
+        Ok(self.bytes(addr, 1)?[0])
+    }
+
+    pub(crate) fn tag(&self, o: u64) -> io::Result<u8> {
         self.u8(o + 7)
     }
 
-    pub(crate) fn field(&self, o: u64, i: u64) -> u64 {
+    pub(crate) fn field(&self, o: u64, i: u64) -> io::Result<u64> {
         self.u64(o + 8 + 8 * i)
     }
 
     /// The `k`th byte of a constructor's scalar area, which follows its object fields.
-    pub(crate) fn scalar_u8(&self, o: u64, k: u64) -> u8 {
-        let num_objs = u64::from(self.u8(o + 6));
+    pub(crate) fn scalar_u8(&self, o: u64, k: u64) -> io::Result<u8> {
+        let num_objs = u64::from(self.u8(o + 6)?);
         self.u8(o + 8 + 8 * num_objs + k)
     }
 
-    pub(crate) fn scalar_u32(&self, o: u64) -> u32 {
-        let b = self.bytes(o + 8 + 8 * u64::from(self.u8(o + 6)), 4);
-        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    pub(crate) fn scalar_u32(&self, o: u64) -> io::Result<u32> {
+        let b = self.bytes(o + 8 + 8 * u64::from(self.u8(o + 6)?), 4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    pub(crate) fn str(&self, o: u64) -> &str {
-        assert_eq!(self.tag(o), STRING, "expected a string object");
-        let size = usize::try_from(self.u64(o + 8)).expect("string size");
-        let bytes = self.bytes(o + 32, size.saturating_sub(1));
-        std::str::from_utf8(bytes).expect("olean strings are UTF-8")
+    fn expect(&self, o: u64, tag: u8, what: &str) -> io::Result<()> {
+        if is_scalar(o) || self.tag(o)? != tag {
+            return Err(corrupt(format!("expected {what} at {o:#x}")));
+        }
+        Ok(())
     }
 
-    pub(crate) fn array(&self, o: u64) -> impl Iterator<Item = u64> + '_ {
-        assert_eq!(self.tag(o), ARRAY, "expected an array object");
-        (0..self.u64(o + 8)).map(move |i| self.u64(o + 24 + 8 * i))
+    pub(crate) fn str(&self, o: u64) -> io::Result<&str> {
+        self.expect(o, STRING, "a string")?;
+        let size = usize::try_from(self.u64(o + 8)?).map_err(corrupt)?;
+        let bytes = self.bytes(o + 32, size.saturating_sub(1))?;
+        std::str::from_utf8(bytes).map_err(corrupt)
     }
 
-    pub(crate) fn list(&self, mut o: u64) -> Vec<u64> {
+    pub(crate) fn array(&self, o: u64) -> io::Result<Vec<u64>> {
+        self.expect(o, ARRAY, "an array")?;
+        (0..self.u64(o + 8)?)
+            .map(|i| self.u64(o + 24 + 8 * i))
+            .collect()
+    }
+
+    pub(crate) fn list(&self, mut o: u64) -> io::Result<Vec<u64>> {
         let mut out = Vec::new();
         while !is_scalar(o) {
-            out.push(self.field(o, 0));
-            o = self.field(o, 1);
+            out.push(self.field(o, 0)?);
+            o = self.field(o, 1)?;
         }
-        out
+        Ok(out)
     }
 
-    pub(crate) fn nat_decimal(&self, o: u64) -> String {
+    pub(crate) fn nat_decimal(&self, o: u64) -> io::Result<String> {
         if is_scalar(o) {
-            return (o >> 1).to_string();
+            return Ok((o >> 1).to_string());
         }
-        assert_eq!(self.tag(o), MPZ, "expected a Nat");
-        assert!(self.header.gmp, "only GMP bignum encoding is supported");
-        let b = self.bytes(o + 12, 4);
+        self.expect(o, MPZ, "a Nat")?;
+        if !self.header.gmp {
+            return Err(corrupt("big Nat literals need a Lean built with GMP"));
+        }
+        let b = self.bytes(o + 12, 4)?;
         let size = u64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs());
-        let mut digits: Vec<u64> = (0..size).map(|i| self.u64(o + 24 + 8 * i)).collect();
-        decimal(&mut digits)
+        let mut digits = (0..size)
+            .map(|i| self.u64(o + 24 + 8 * i))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(decimal(&mut digits))
     }
 }
 
@@ -173,13 +198,20 @@ pub(crate) const fn is_scalar(o: u64) -> bool {
     o & 1 == 1
 }
 
-pub(crate) fn small_nat(o: u64) -> u64 {
-    assert!(is_scalar(o), "unexpected bignum in a small Nat field");
-    o >> 1
+pub(crate) fn small_nat(o: u64) -> io::Result<u64> {
+    if is_scalar(o) {
+        Ok(o >> 1)
+    } else {
+        Err(corrupt(format!(
+            "expected a small Nat, found pointer {o:#x}"
+        )))
+    }
 }
 
 fn le64(b: &[u8]) -> u64 {
-    u64::from_le_bytes(b.try_into().expect("eight bytes"))
+    let mut a = [0; 8];
+    a.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(a)
 }
 
 fn decimal(limbs: &mut Vec<u64>) -> String {

@@ -100,14 +100,12 @@ fn run(cli: &Cli) -> io::Result<()> {
         .jobs
         .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
     pb.set_message(format!("finding modules, {jobs} threads"));
-    let env = Env::load_with(&search, &roots, jobs, &mut |env: &Env| {
-        if let Some(m) = env.modules.last() {
-            pb.set_message(format!(
-                "{} modules, {} constants  {m}",
-                HumanCount(env.modules.len() as u64),
-                HumanCount(env.consts.len() as u64)
-            ));
-        }
+    let env = Env::load_with(&search, &roots, jobs, &|modules, consts| {
+        pb.set_message(format!(
+            "{} modules, {} constants",
+            HumanCount(modules as u64),
+            HumanCount(consts as u64)
+        ));
     })?;
     pb.finish_and_clear();
     let loaded = start.elapsed();
