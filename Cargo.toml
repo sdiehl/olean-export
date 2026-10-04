@@ -2,7 +2,7 @@
 name = "olean-export"
 version = "0.1.0"
 authors = ["Stephen Diehl <stephen.m.diehl@gmail.com>"]
-categories = ["mathematics", "lean", "lean4"]
+categories = ["mathematics", "parser-implementations", "command-line-utilities"]
 documentation = "https://docs.rs/olean-export"
 edition = "2021"
 homepage = "https://github.com/sdiehl/olean-export"
