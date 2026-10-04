@@ -1,6 +1,8 @@
 # tiny-olean
 
-Read Lean 4 `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers such as [nanoda](https://github.com/ammkrn/nanoda_lib), without starting Lean. An `.olean` is a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order.
+Rust library to read Lean 4 `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
+
+The big idea is an `.olean` is a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But like fast.
 
 The object layout is tied to the Lean release. This version targets olean format v2 as written by Lean 4.34 and 4.35.
 
@@ -25,10 +27,10 @@ lean -o Hello.olean Hello.lean
 export LEAN_PATH=.:$(lean --print-prefix)/lib/lean
 ```
 
-Export one theorem with everything it depends on, then check it with a kernel:
+Export one theorem with everything it depends on, then check it with a kernel. Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
 
 ```bash
-$ tiny-olean Hello -c double_two -o hello.ndjson
+$ lake env tiny-olean Hello -c double_two -o hello.ndjson
 654 modules, 65,373 constants decoded in 1.41s
 36.82 KiB of NDJSON (138 names, 16 levels, 490 exprs) in 1.41s total, 11.99 MiB/s
 
@@ -42,12 +44,6 @@ Checked 39 declarations with no errors
 ```
 
 Without `-c` it exports every constant reachable from the module, like `lean4export Hello`.
-
-Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
-
-```bash
-lake env tiny-olean Mathlib -o mathlib.ndjson
-```
 
 ## Performance
 
