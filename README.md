@@ -47,15 +47,15 @@ Wall time:
 
 | Target                    | lean4export | tiny-olean | Speedup |
 | ------------------------- | ----------- | ---------- | ------- |
-| Small model on `Lean`     | 18.3s       | 1.5s       | 12x     |
-| Mathlib-dependent library | 1541s       | 23s        | 67x     |
+| Small model on `Lean`     | 18.3s       | 1.0s       | 18x     |
+| Mathlib-dependent library | 1541s       | 15s        | 100x    |
 
 Peak memory:
 
 | Target                    | lean4export | tiny-olean |
 | ------------------------- | ----------- | ---------- |
 | Small model on `Lean`     | 1.3 GB      | 0.5 GB     |
-| Mathlib-dependent library | 9.4 GB      | 4.3 GB     |
+| Mathlib-dependent library | 9.4 GB      | 4.2 GB     |
 
 ## License
 

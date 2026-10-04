@@ -1,5 +1,6 @@
 use crate::olean::{at, corrupt, is_scalar, small_nat, Header, Image};
 use hashbrown::{hash_table::Entry, HashTable};
+use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::{
@@ -8,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
-        Mutex, MutexGuard, OnceLock,
+        OnceLock,
     },
 };
 
@@ -213,10 +214,6 @@ const fn shard_of(h: u64) -> usize {
     (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize % SHARDS
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().expect("a decoding thread panicked")
-}
-
 fn id(n: usize) -> u32 {
     u32::try_from(n).expect("table overflow")
 }
@@ -243,7 +240,7 @@ impl<T: Hash + Eq> Shared<T> {
     fn intern(&self, t: T) -> u32 {
         let h = hash(&t);
         let k = shard_of(h);
-        let mut g = lock(&self.0[k]);
+        let mut g = self.0[k].lock();
         let s = &mut *g;
         let nodes = &mut s.nodes;
         let i = match s.index.entry(
@@ -263,12 +260,7 @@ impl<T: Hash + Eq> Shared<T> {
     }
 
     fn freeze(self) -> Table<T> {
-        Table(
-            self.0
-                .into_iter()
-                .map(|m| m.into_inner().expect("a decoding thread panicked"))
-                .collect(),
-        )
+        Table(self.0.into_iter().map(Mutex::into_inner).collect())
     }
 }
 
@@ -343,18 +335,17 @@ impl SharedExprs {
     }
 
     fn chunk(&self, k: usize) -> MutexGuard<'_, Chunk> {
-        lock(
-            self.chunks[k]
-                .get()
-                .expect("chunk is published before its ids"),
-        )
+        self.chunks[k]
+            .get()
+            .expect("chunk is published before its ids")
+            .lock()
     }
 
     /// Intern `e` from module `rank`, adding it to the chunk `cursor` if it is new.
     #[allow(clippy::significant_drop_tightening)]
     fn intern(&self, e: Expr, rank: u32, cursor: &mut Option<usize>) -> u32 {
         let h = hash(&e);
-        let mut index = lock(&self.index[shard_of(h)]);
+        let mut index = self.index[shard_of(h)].lock();
         let node = |i: u32, f: &mut dyn FnMut(&mut Expr, &mut u32)| {
             let i = i as usize;
             let mut g = self.chunk(i / CHUNK);
@@ -414,7 +405,7 @@ impl SharedExprs {
         let n = self.next.into_inner();
         let chunks = self.chunks.into_iter().take(n).map(|c| {
             let c = c.into_inner().expect("chunk is published");
-            c.into_inner().expect("a decoding thread panicked").nodes
+            c.into_inner().nodes
         });
         Exprs(chunks.collect())
     }
