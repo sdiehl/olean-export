@@ -12,10 +12,9 @@ cargo run --example demo
 
 ## Example
 
-Compile a Lean file to an olean with plain `lean`:
+[`examples/Hello.lean`](examples/Hello.lean) is compiled to an olean with plain `lean`:
 
 ```lean
--- Hello.lean
 def double (n : Nat) : Nat := n + n
 
 theorem double_two : double 2 = 4 := rfl
@@ -38,11 +37,13 @@ $ head -3 hello.ndjson
 {"in":1,"str":{"pre":0,"str":"Eq"}}
 {"in":2,"str":{"pre":1,"str":"refl"}}
 
-$ sokonanoda --nat-extension --stdin < hello.ndjson
+$ sokonanoda --nat-extension --print-success-message --stdin < hello.ndjson
 Checked 39 declarations with no errors
 ```
 
-Without `-c` it exports every constant reachable from the module, like `lean4export Hello`. Inside a Lake project, `lake env` sets `LEAN_PATH` for you:
+Without `-c` it exports every constant reachable from the module, like `lean4export Hello`.
+
+Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
 
 ```bash
 lake env tiny-olean Mathlib -o mathlib.ndjson

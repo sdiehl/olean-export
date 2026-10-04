@@ -15,7 +15,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,6 +29,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check markdown, JSON and TOML
+        uses: dprint/check@v2.5
+
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -37,3 +40,9 @@ jobs:
 
       - name: Build release
         run: cargo build --all --release
+
+      - name: Run example
+        run: cargo run --example demo
+
+      - name: Export fixtures with the CLI
+        run: ./target/release/tiny-olean Top -L tests/cases/build -o top.ndjson
