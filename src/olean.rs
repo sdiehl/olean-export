@@ -3,8 +3,12 @@ use memmap2::{Mmap, MmapOptions};
 use std::{fmt::Write as _, fs::File, path::Path};
 
 const ARRAY: u8 = 246;
+const SCALAR_ARRAY: u8 = 248;
 const STRING: u8 = 249;
 const MPZ: u8 = 250;
+const THUNK: u8 = 251;
+const TASK: u8 = 252;
+const REF: u8 = 253;
 
 /// Fields of the fixed-size header that precedes every compacted region.
 #[derive(Debug, Clone, Default)]
@@ -15,17 +19,17 @@ pub struct Header {
 }
 
 #[derive(Debug)]
-struct Part {
-    base: u64,
+pub(crate) struct Part {
+    pub(crate) base: u64,
     slot: usize,
-    bytes: Mmap,
+    pub(crate) bytes: Mmap,
 }
 
 /// One module's compacted regions. Objects are addressed by the absolute pointers the
 /// compactor wrote, and the parts of a `module` file share one address space.
 #[derive(Debug)]
 pub(crate) struct Image {
-    parts: Vec<Part>,
+    pub(crate) parts: Vec<Part>,
     pub(crate) header: Header,
     pub(crate) root: u64,
 }
@@ -45,6 +49,17 @@ impl Image {
             root: 0,
         };
         img.push_part(path)?;
+        Ok(img)
+    }
+
+    /// Open a module's `.olean`, adding its `.server` and `.private` parts if it is in the
+    /// module system. The root is then the private part's, which sees all of them.
+    pub(crate) fn open_module(path: &Path) -> Result<Self> {
+        let mut img = Self::open(path)?;
+        if img.scalar_u8(img.root, 0).map_err(at(path))? == 1 {
+            img.push_part(&path.with_extension("olean.server"))?;
+            img.push_part(&path.with_extension("olean.private"))?;
+        }
         Ok(img)
     }
 
@@ -134,6 +149,45 @@ impl Image {
     pub(crate) fn scalar_u32(&self, o: u64) -> Result<u32> {
         let b = self.bytes(o + 8 + 8 * u64::from(self.u8(o + 6)?), 4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// The size in bytes of the object at `o`, calling `f` on each object it points to.
+    pub(crate) fn children(&self, o: u64, mut f: impl FnMut(u64)) -> Result<u64> {
+        let mut each = |from: u64, n: u64| -> Result<()> {
+            for i in 0..n {
+                let c = self.u64(from + 8 * i)?;
+                if !is_scalar(c) {
+                    f(c);
+                }
+            }
+            Ok(())
+        };
+        let b = self.bytes(o + 4, 2)?;
+        let cs_sz = u64::from(u16::from_le_bytes([b[0], b[1]]));
+        let size = match self.tag(o)? {
+            ARRAY => {
+                let n = self.u64(o + 16)?;
+                each(o + 24, n)?;
+                24 + 8 * n
+            }
+            SCALAR_ARRAY => 24 + u64::from(self.u8(o + 6)?) * self.u64(o + 16)?,
+            STRING => 32 + self.u64(o + 16)?,
+            THUNK | TASK => {
+                each(o + 8, 1)?;
+                24
+            }
+            REF => {
+                each(o + 8, 1)?;
+                16
+            }
+            MPZ => cs_sz,
+            t if t > MPZ => return Err(corrupt(format!("unexpected object tag {t} at {o:#x}"))),
+            _ => {
+                each(o + 8, u64::from(self.u8(o + 6)?))?;
+                cs_sz
+            }
+        };
+        Ok(size.next_multiple_of(8))
     }
 
     fn expect(&self, o: u64, tag: u8, what: &str) -> Result<()> {

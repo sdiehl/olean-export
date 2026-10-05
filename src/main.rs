@@ -1,6 +1,6 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use olean_export::{search_path, with_big_stack, Env, Exporter};
+use olean_export::{resolve, search_path, with_big_stack, Env, Exporter, Summary};
 use std::{
     cell::Cell,
     error::Error,
@@ -21,9 +21,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Debug, Parser)]
 #[command(
     version,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
     after_help = "Run under `lake env` so LEAN_PATH covers your build and the toolchain:\n  lake env olean-export Mathlib -o mathlib.ndjson"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Root modules to load, e.g. `Mathlib` or `MyProject.Main`
     #[arg(required = true, value_name = "MODULE")]
     modules: Vec<String>,
@@ -34,7 +38,7 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
     /// Search DIR before `LEAN_PATH` (repeatable)
-    #[arg(short = 'L', long = "search", value_name = "DIR")]
+    #[arg(short = 'L', long = "search", value_name = "DIR", global = true)]
     search: Vec<PathBuf>,
     /// Decode modules on N threads [default: all cores]
     #[arg(short, long, value_name = "N")]
@@ -42,6 +46,19 @@ struct Cli {
     /// No progress bars or summary
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Summarize one olean: header, imports, constants and where its bytes go
+    Inspect {
+        /// A module name such as `Init.Prelude`, or a path to an .olean
+        #[arg(value_name = "MODULE|FILE")]
+        target: String,
+        /// List every constant with its kind
+        #[arg(short, long)]
+        consts: bool,
+    },
 }
 
 struct Counting<W> {
@@ -63,8 +80,18 @@ impl<W: Write> Write for Counting<W> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match with_big_stack(|| run(&cli)) {
+    let result = match &cli.command {
+        Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
+        None => with_big_stack(|| run(&cli)),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e)
+            if e.downcast_ref::<io::Error>().map(io::Error::kind)
+                == Some(io::ErrorKind::BrokenPipe) =>
+        {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -86,12 +113,101 @@ fn bar(quiet: bool, len: Option<u64>, template: &str) -> ProgressBar {
     pb
 }
 
-fn run(cli: &Cli) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let start = Instant::now();
-    let search: Vec<PathBuf> = cli.search.iter().cloned().chain(search_path()).collect();
-    if search.is_empty() {
+type Res = Result<(), Box<dyn Error + Send + Sync>>;
+
+fn search(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error + Send + Sync>> {
+    let dirs: Vec<PathBuf> = cli.search.iter().cloned().chain(search_path()).collect();
+    if dirs.is_empty() {
         return Err("no search path: run under `lake env` or pass -L DIR".into());
     }
+    Ok(dirs)
+}
+
+fn inspect(cli: &Cli, target: &str, list: bool) -> Res {
+    let path = PathBuf::from(target);
+    let path = if path.is_file() {
+        path
+    } else {
+        resolve(&search(cli)?, target)?
+    };
+    let s = Summary::open(&path)?;
+    let flag = |on: bool, s: &'static str| if on { s } else { "" };
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "Lean {} ({}){}{}",
+        s.header.version,
+        s.header.githash,
+        flag(s.header.gmp, ", gmp"),
+        flag(s.is_module, ", module")
+    )?;
+    for (p, n) in &s.parts {
+        writeln!(out, "  {:>11}  {}", HumanBytes(*n).to_string(), p.display())?;
+    }
+    writeln!(out, "\nimports ({})", s.imports.len())?;
+    for i in &s.imports {
+        writeln!(
+            out,
+            "  {}{}{}{}",
+            i.module,
+            flag(i.all, " all"),
+            flag(!i.exported, " private"),
+            flag(i.meta, " meta")
+        )?;
+    }
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for d in &s.consts {
+        match kinds.iter_mut().find(|k| k.0 == d.kind) {
+            Some(k) => k.1 += 1,
+            None => kinds.push((d.kind, 1)),
+        }
+    }
+    kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    writeln!(
+        out,
+        "\nconstants ({}): {}",
+        s.consts.len(),
+        kinds.join(", ")
+    )?;
+    if list {
+        let mut consts: Vec<_> = s.consts.iter().collect();
+        consts.sort_by(|a, b| a.name.cmp(&b.name));
+        for d in consts {
+            let line = format!("  {:<9} {} {}", d.kind, d.name, d.safety);
+            writeln!(out, "{}", line.trim_end())?;
+        }
+    }
+    let mut sections: Vec<_> = s.sections.iter().filter(|x| x.items > 0).collect();
+    sections.sort_by_key(|x| std::cmp::Reverse(x.bytes));
+    let total = s.bytes().max(1);
+    let row = |out: &mut io::StdoutLock<'_>, bytes: u64, items: String, name: &str| {
+        #[allow(clippy::cast_precision_loss)]
+        let share = 100.0 * bytes as f64 / total as f64;
+        let size = HumanBytes(bytes).to_string();
+        writeln!(out, "{size:>11}  {share:>5.1}%  {items:>6}  {name}")
+    };
+    writeln!(
+        out,
+        "\n{:>11}  {:>6}  {:>6}  section",
+        "bytes", "share", "items"
+    )?;
+    for x in &sections {
+        row(&mut out, x.bytes, x.items.to_string(), &x.name)?;
+    }
+    let reached: u64 = s.sections.iter().map(|x| x.bytes).sum();
+    row(
+        &mut out,
+        total.saturating_sub(reached),
+        String::new(),
+        "(headers and unreached)",
+    )?;
+    Ok(())
+}
+
+fn run(cli: &Cli) -> Res {
+    let start = Instant::now();
+    let search = search(cli)?;
     let roots: Vec<&str> = cli.modules.iter().map(String::as_str).collect();
 
     let pb = bar(

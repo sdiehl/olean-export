@@ -57,6 +57,27 @@ Peak memory:
 | Small model on `Lean`     | 1.3 GB      | 0.5 GB       |
 | Mathlib-dependent library | 9.4 GB      | 4.2 GB       |
 
+## Inspect
+
+`inspect` summarizes one module's olean, by name or path, without decoding any terms: the Lean release, the module system parts, imports, constant kinds, and how many bytes each section and environment extension holds. Shared objects count toward the first section that reaches them, constants first. Pass `-c` to list every constant.
+
+```bash
+$ olean-export inspect tests/cases/build/Top.olean
+Lean 4.35.0-rc3 (470d5ce1400764999581fd26d5d72b00d990b0f4), gmp
+    39.64 KiB  tests/cases/build/Top.olean
+
+imports (1)
+  Base
+
+constants (24): 8 def, 6 ctor, 4 inductive, 4 recursor, 2 theorem
+
+      bytes   share   items  section
+  32.43 KiB   81.8%      24  constants
+   1.66 KiB    4.2%       7  Lean.declRangeExt
+   1.09 KiB    2.8%      24  _private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt
+   ...
+```
+
 ## License
 
 MIT Licensed. Copyright 2026 Stephen Diehl. See [LICENSE](LICENSE) for details.

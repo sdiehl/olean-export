@@ -638,11 +638,7 @@ impl Env {
 }
 
 fn decode(tables: &Tables, rank: u32, cursor: &mut Option<usize>, path: &Path) -> Result<Module> {
-    let mut img = Image::open(path)?;
-    if img.scalar_u8(img.root, 0).map_err(at(path))? == 1 {
-        img.push_part(&path.with_extension("olean.server"))?;
-        img.push_part(&path.with_extension("olean.private"))?;
-    }
+    let img = Image::open_module(path)?;
     let mut dec = Decoder {
         img: &img,
         tables,
@@ -681,7 +677,9 @@ fn discover(
     Ok(())
 }
 
-fn resolve(search: &[PathBuf], module: &str) -> Result<PathBuf> {
+/// The `.olean` for a dotted module name such as `Init.Prelude`, from the first directory
+/// of `search` that has it.
+pub fn resolve(search: &[PathBuf], module: &str) -> Result<PathBuf> {
     let rel: PathBuf = module.split('.').collect();
     search
         .iter()
@@ -691,7 +689,7 @@ fn resolve(search: &[PathBuf], module: &str) -> Result<PathBuf> {
 }
 
 impl Image {
-    fn imports(&self) -> Result<Vec<String>> {
+    pub(crate) fn imports(&self) -> Result<Vec<String>> {
         let imports = self.array(self.field(self.root, 0)?)?;
         imports
             .into_iter()
@@ -699,7 +697,7 @@ impl Image {
             .collect()
     }
 
-    fn str_name(&self, mut o: u64) -> Result<String> {
+    pub(crate) fn str_name(&self, mut o: u64) -> Result<String> {
         let mut parts = Vec::new();
         while !is_scalar(o) && self.tag(o)? != 0 {
             parts.push(if self.tag(o)? == 1 {

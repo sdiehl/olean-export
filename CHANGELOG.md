@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `inspect` subcommand summarizing an olean's imports, constants and bytes per section.
+
 ## 0.1.0 (2026-10-04)
 
 - Read Lean 4.26 to 4.35 `.olean` files and emit the lean4export 3.1.0 NDJSON stream.

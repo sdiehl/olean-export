@@ -13,14 +13,16 @@
 mod env;
 mod error;
 mod export;
+mod inspect;
 mod olean;
 
 pub use env::{
-    search_path, Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Exprs, Hints, Id, Inductive,
-    Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Rule, Table, ANON, ZERO,
+    resolve, search_path, Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Exprs, Hints, Id,
+    Inductive, Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Rule, Table, ANON, ZERO,
 };
 pub use error::{Error, Result};
 pub use export::{Counts, Exporter};
+pub use inspect::{Decl, Import, Section, Summary};
 pub use olean::{Header, SUPPORTED};
 
 const STACK: usize = 1 << 30;
