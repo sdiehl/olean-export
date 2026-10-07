@@ -1,32 +1,28 @@
 use crate::{
     env::{
-        Binder, Const, Ctor, Env, Expr, ExprId, Hints, Inductive, Kind, Level, LevelId, Name,
-        NameId, QuotKind, Rec, ANON, ZERO,
+        Const, Ctor, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name, NameId, Rec, ANON,
+        ZERO,
     },
     error::{corrupt, Result},
+    ndjson::Ndjson,
+    record::{
+        Binding, Counts, Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Safety, Sink,
+    },
 };
 use rustc_hash::FxHashSet;
-use std::{fmt::Write as _, io::Write};
+use std::io::Write;
 
 const UNSEEN: u32 = u32::MAX;
 
-/// Lines written so far for each table, which is also the next id each hands out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Counts {
-    pub names: u32,
-    pub levels: u32,
-    pub exprs: u32,
-}
-
-/// Streams an [`Env`] in the lean4export 3.1.0 NDJSON format. Ids are assigned on first
-/// use and every line only refers to lines already written.
+/// Streams an [`Env`] in lean4export 3.1.0 order to a [`Sink`], NDJSON by default. Ids are
+/// assigned on first use and every record only refers to records already written.
 ///
 /// Exporting recurses once per nested subterm, which overflows the default stack on large
 /// libraries such as Mathlib, so run it inside [`crate::with_big_stack`].
 #[derive(Debug)]
-pub struct Exporter<'a, W: Write> {
+pub struct Exporter<'a, S: Sink> {
     env: &'a Env,
-    out: W,
+    sink: S,
     names: Vec<u32>,
     levels: Vec<u32>,
     exprs: Vec<u32>,
@@ -36,55 +32,16 @@ pub struct Exporter<'a, W: Write> {
     nat: Option<NameId>,
     str_deps: [Option<NameId>; 2],
     quot: [Option<NameId>; 5],
-    buf: Line,
 }
 
-/// A reusable output line, since `format!` per record dominated export time.
-#[derive(Debug, Default)]
-struct Line(Vec<u8>);
-
-impl Line {
-    fn s(&mut self, s: &str) -> &mut Self {
-        self.0.extend_from_slice(s.as_bytes());
-        self
-    }
-
-    fn n(&mut self, n: impl itoa::Integer) -> &mut Self {
-        self.s(itoa::Buffer::new().format(n))
-    }
-
-    fn list(&mut self, ids: &[u32]) -> &mut Self {
-        self.s("[");
-        for (i, &id) in ids.iter().enumerate() {
-            if i > 0 {
-                self.s(",");
-            }
-            self.n(id);
-        }
-        self.s("]")
-    }
-
-    fn q(&mut self, s: &str) -> &mut Self {
-        self.s("\"");
-        for c in s.chars() {
-            match c {
-                '"' => self.s("\\\""),
-                '\\' => self.s("\\\\"),
-                '\n' => self.s("\\n"),
-                '\r' => self.s("\\r"),
-                '\t' => self.s("\\t"),
-                c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                    self.s("\\u00").s(&format!("{:02x}", c as u32))
-                }
-                c => self.s(c.encode_utf8(&mut [0; 4])),
-            };
-        }
-        self.s("\"")
-    }
-}
-
-impl<'a, W: Write> Exporter<'a, W> {
+impl<'a, W: Write> Exporter<'a, Ndjson<W>> {
     pub fn new(env: &'a Env, out: W) -> Self {
+        Self::with_sink(env, Ndjson::new(out))
+    }
+}
+
+impl<'a, S: Sink> Exporter<'a, S> {
+    pub fn with_sink(env: &'a Env, sink: S) -> Self {
         let mut names = vec![UNSEEN; env.names.bound()];
         let mut levels = vec![UNSEEN; env.levels.bound()];
         names[ANON.index()] = 0;
@@ -92,15 +49,11 @@ impl<'a, W: Write> Exporter<'a, W> {
         let find = |s| env.find_name(s);
         Self {
             env,
-            out,
+            sink,
             names,
             levels,
             exprs: vec![UNSEEN; env.exprs.bound()],
-            next: Counts {
-                names: 1,
-                levels: 1,
-                exprs: 0,
-            },
+            next: Counts::default(),
             scanned: vec![false; env.exprs.bound()],
             visited: FxHashSet::default(),
             nat: find("Nat"),
@@ -112,20 +65,18 @@ impl<'a, W: Write> Exporter<'a, W> {
                 find("Quot.lift"),
                 find("Quot.ind"),
             ],
-            buf: Line::default(),
         }
     }
 
     pub fn meta(&mut self) -> Result<()> {
         let h = &self.env.header;
-        writeln!(
-            self.out,
-            r#"{{"meta":{{"exporter":{{"name":"olean-export","version":"{}"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"{}","version":"{}"}}}}}}"#,
+        let meta = format!(
+            r#"{{"exporter":{{"name":"olean-export","version":"{}"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"{}","version":"{}"}}}}"#,
             env!("CARGO_PKG_VERSION"),
             h.githash,
             h.version
-        )?;
-        Ok(())
+        );
+        self.sink.record(&Record::Meta(meta.into()))
     }
 
     /// Export every non-internal constant in load order, like `lean4export` with no `--`.
@@ -138,26 +89,10 @@ impl<'a, W: Write> Exporter<'a, W> {
         self.next
     }
 
-    pub fn finish(mut self) -> Result<W> {
-        self.out.flush()?;
-        Ok(self.out)
-    }
-
-    fn start(&mut self) -> &mut Line {
-        self.buf.0.clear();
-        &mut self.buf
-    }
-
-    fn emit(&mut self) -> Result<()> {
-        self.buf.0.push(b'\n');
-        self.out.write_all(&self.buf.0)?;
-        Ok(())
-    }
-
-    fn line(&mut self, s: &str) -> Result<()> {
-        self.out.write_all(s.as_bytes())?;
-        self.out.write_all(b"\n")?;
-        Ok(())
+    /// Write the end record and hand back the sink's output.
+    pub fn finish(mut self) -> Result<S::Output> {
+        self.sink.record(&Record::End(self.next))?;
+        self.sink.finish()
     }
 
     fn name(&mut self, n: NameId) -> Result<u32> {
@@ -168,37 +103,25 @@ impl<'a, W: Write> Exporter<'a, W> {
             Name::Anon => unreachable!(),
             Name::Str(p, s) => {
                 let p = self.name(*p)?;
-                let id = fresh(&mut self.next.names);
-                self.start()
-                    .s(r#"{"in":"#)
-                    .n(id)
-                    .s(r#","str":{"pre":"#)
-                    .n(p);
-                self.buf.s(r#","str":"#).q(s).s("}}");
-                id
+                self.emit(&Record::NameStr {
+                    pre: p,
+                    str: s.as_ref().into(),
+                })?
             }
             Name::Num(p, i) => {
                 let p = self.name(*p)?;
-                let id = fresh(&mut self.next.names);
-                self.start().s(r#"{"in":"#).n(id).s(r#","num":{"i":"#).n(*i);
-                self.buf.s(r#","pre":"#).n(p).s("}}");
-                id
+                self.emit(&Record::NameNum { pre: p, i: *i })?
             }
         };
-        self.emit()?;
         self.names[n.index()] = id;
         Ok(id)
     }
 
-    fn name_list(&mut self, ns: &[NameId]) -> Result<String> {
-        let ids = ns
-            .iter()
-            .map(|&n| self.name(n))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(json_list(&ids))
+    fn name_list(&mut self, ns: &[NameId]) -> Result<Vec<u32>> {
+        ns.iter().map(|&n| self.name(n)).collect()
     }
 
-    fn level_params(&mut self, ps: &[NameId]) -> Result<String> {
+    fn level_params(&mut self, ps: &[NameId]) -> Result<Vec<u32>> {
         let list = self.name_list(ps)?;
         for &p in ps {
             let l = self
@@ -215,27 +138,14 @@ impl<'a, W: Write> Exporter<'a, W> {
         if self.levels[l.index()] != UNSEEN {
             return Ok(self.levels[l.index()]);
         }
-        let (key, a, b) = match self.env.levels[l] {
+        let r = match self.env.levels[l] {
             Level::Zero => unreachable!(),
-            Level::Succ(a) => ("succ", self.level(a)?, None),
-            Level::Max(a, b) => ("max", self.level(a)?, Some(self.level(b)?)),
-            Level::IMax(a, b) => ("imax", self.level(a)?, Some(self.level(b)?)),
-            Level::Param(n) => ("param", self.name(n)?, None),
+            Level::Succ(a) => Record::Succ(self.level(a)?),
+            Level::Max(a, b) => Record::Max(self.level(a)?, self.level(b)?),
+            Level::IMax(a, b) => Record::IMax(self.level(a)?, self.level(b)?),
+            Level::Param(n) => Record::Param(self.name(n)?),
         };
-        let id = fresh(&mut self.next.levels);
-        let line = self
-            .start()
-            .s(r#"{"il":"#)
-            .n(id)
-            .s(r#",""#)
-            .s(key)
-            .s(r#"":"#);
-        match b {
-            None => line.n(a),
-            Some(b) => line.s("[").n(a).s(",").n(b).s("]"),
-        }
-        .s("}");
-        self.emit()?;
+        let id = self.emit(&r)?;
         self.levels[l.index()] = id;
         Ok(id)
     }
@@ -244,68 +154,20 @@ impl<'a, W: Write> Exporter<'a, W> {
         if self.exprs[e.index()] != UNSEEN {
             return Ok(self.exprs[e.index()]);
         }
-        let id = match &self.env.exprs[e] {
-            Expr::BVar(i) => {
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"bvar":"#)
-                    .n(*i)
-                    .s(r#","ie":"#)
-                    .n(id)
-                    .s("}");
-                id
-            }
-            Expr::Sort(l) => {
-                let l = self.level(*l)?;
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"ie":"#)
-                    .n(id)
-                    .s(r#","sort":"#)
-                    .n(l)
-                    .s("}");
-                id
-            }
-            Expr::Const(n, us) => {
-                let n = self.name(*n)?;
-                let us = us
-                    .iter()
-                    .map(|&u| self.level(u))
-                    .collect::<Result<Vec<_>>>()?;
-                let id = fresh(&mut self.next.exprs);
-                self.start().s(r#"{"const":{"name":"#).n(n).s(r#","us":"#);
-                self.buf.list(&us).s(r#"},"ie":"#).n(id).s("}");
-                id
-            }
-            Expr::App(f, a) => {
-                let (f, a) = (self.expr(*f)?, self.expr(*a)?);
-                let id = fresh(&mut self.next.exprs);
-                self.start().s(r#"{"app":{"arg":"#).n(a).s(r#","fn":"#).n(f);
-                self.buf.s(r#"},"ie":"#).n(id).s("}");
-                id
-            }
-            Expr::Lam(n, t, b, bi) | Expr::Pi(n, t, b, bi) => {
-                let (n, t, b) = (self.name(*n)?, self.expr(*t)?, self.expr(*b)?);
-                let id = fresh(&mut self.next.exprs);
-                let lam = matches!(self.env.exprs[e], Expr::Lam(..));
-                let line = self.start();
-                if lam {
-                    line.s(r#"{"ie":"#).n(id).s(r#","lam":"#);
-                } else {
-                    line.s(r#"{"forallE":"#);
-                }
-                line.s(r#"{"binderInfo":""#)
-                    .s(binder(*bi))
-                    .s(r#"","body":"#)
-                    .n(b);
-                line.s(r#","name":"#).n(n).s(r#","type":"#).n(t).s("}");
-                if lam {
-                    line.s("}");
-                } else {
-                    line.s(r#","ie":"#).n(id).s("}");
-                }
-                id
-            }
+        let env = self.env;
+        let r = match &env.exprs[e] {
+            Expr::BVar(i) => Record::BVar(*i),
+            Expr::Sort(l) => Record::Sort(self.level(*l)?),
+            Expr::Const(n, us) => Record::Const {
+                name: self.name(*n)?,
+                us: us.iter().map(|&u| self.level(u)).collect::<Result<_>>()?,
+            },
+            Expr::App(f, a) => Record::App {
+                fun: self.expr(*f)?,
+                arg: self.expr(*a)?,
+            },
+            Expr::Lam(n, t, b, bi) => Record::Lam(self.binding(*n, *t, *b, *bi)?),
+            Expr::Pi(n, t, b, bi) => Record::Pi(self.binding(*n, *t, *b, *bi)?),
             Expr::Let(n, t, v, b) => {
                 let (n, t, v, b) = (
                     self.name(*n)?,
@@ -313,68 +175,68 @@ impl<'a, W: Write> Exporter<'a, W> {
                     self.expr(*v)?,
                     self.expr(*b)?,
                 );
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"ie":"#)
-                    .n(id)
-                    .s(r#","letE":{"body":"#)
-                    .n(b);
-                self.buf
-                    .s(r#","name":"#)
-                    .n(n)
-                    // Lean marks most `let`s nondep, but lean4export writes false for all of
-                    // them so that terms differing only in the flag share one index.
-                    .s(r#","nondep":false,"type":"#)
-                    .n(t);
-                self.buf.s(r#","value":"#).n(v).s("}}");
-                id
+                // Lean marks most `let`s nondep, but lean4export writes false for all of
+                // them so that terms differing only in the flag share one index.
+                Record::Let {
+                    name: n,
+                    ty: t,
+                    value: v,
+                    body: b,
+                    nondep: false,
+                }
             }
             Expr::Nat(v) => {
                 if let Some(nat) = self.nat {
                     self.constant(nat)?;
                 }
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"ie":"#)
-                    .n(id)
-                    .s(r#","natVal":""#)
-                    .s(v)
-                    .s(r#""}"#);
-                id
+                Record::Nat(v.as_ref().into())
             }
             Expr::Str(v) => {
                 for c in self.str_deps.into_iter().flatten() {
                     self.constant(c)?;
                 }
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"ie":"#)
-                    .n(id)
-                    .s(r#","strVal":"#)
-                    .q(v)
-                    .s("}");
-                id
+                Record::Str(v.as_ref().into())
             }
             Expr::Proj(n, i, x) => {
                 let (n, x) = (self.name(*n)?, self.expr(*x)?);
-                let id = fresh(&mut self.next.exprs);
-                self.start()
-                    .s(r#"{"ie":"#)
-                    .n(id)
-                    .s(r#","proj":{"idx":"#)
-                    .n(*i);
-                self.buf
-                    .s(r#","struct":"#)
-                    .n(x)
-                    .s(r#","typeName":"#)
-                    .n(n)
-                    .s("}}");
-                id
+                Record::Proj {
+                    type_name: n,
+                    idx: *i,
+                    struct_: x,
+                }
             }
         };
-        self.emit()?;
+        let id = self.emit(&r)?;
         self.exprs[e.index()] = id;
         Ok(id)
+    }
+
+    fn binding(
+        &mut self,
+        n: NameId,
+        t: ExprId,
+        b: ExprId,
+        info: crate::env::Binder,
+    ) -> Result<Binding> {
+        Ok(Binding {
+            info,
+            name: self.name(n)?,
+            ty: self.expr(t)?,
+            body: self.expr(b)?,
+        })
+    }
+
+    /// Write a name, level or expression record and return its id.
+    fn emit(&mut self, r: &Record<'_>) -> Result<u32> {
+        self.sink.record(r)?;
+        Ok(self
+            .next
+            .assign(r)
+            .expect("emit takes only id-bearing records"))
+    }
+
+    fn decl(&mut self, d: Decl) -> Result<()> {
+        self.sink.record(&Record::Decl(d))
     }
 
     fn deps(&mut self, e: ExprId) -> Result<()> {
@@ -411,39 +273,43 @@ impl<'a, W: Write> Exporter<'a, W> {
         match &k.kind {
             Kind::Axiom => {
                 self.deps(k.ty)?;
-                let (n, lp, t) = self.header(k)?;
-                self.line(&format!(
-                    r#"{{"axiom":{{"isUnsafe":false,"levelParams":{lp},"name":{n},"type":{t}}}}}"#
-                ))
+                let head = self.header(k)?;
+                self.decl(Decl::Axiom {
+                    head,
+                    is_unsafe: false,
+                    all: None,
+                })
             }
             Kind::Defn(d) => {
                 self.deps(k.ty)?;
                 self.deps(d.value)?;
-                let (n, lp, t) = self.header(k)?;
-                let v = self.expr(d.value)?;
+                let head = self.header(k)?;
+                let value = self.expr(d.value)?;
                 let all = self.name_list(&d.all)?;
-                let hints = match d.hints {
-                    Hints::Opaque => r#""opaque""#.to_owned(),
-                    Hints::Abbrev => r#""abbrev""#.to_owned(),
-                    Hints::Regular(h) => format!(r#"{{"regular":{h}}}"#),
-                };
-                self.line(&format!(
-                    r#"{{"def":{{"all":{all},"hints":{hints},"levelParams":{lp},"name":{n},"safety":"safe","type":{t},"value":{v}}}}}"#
-                ))
+                self.decl(Decl::Def {
+                    head,
+                    value,
+                    hints: d.hints,
+                    all,
+                    safety: Safety::Safe,
+                })
             }
             Kind::Thm(b) | Kind::Opaque(b) => {
                 self.deps(k.ty)?;
                 self.deps(b.value)?;
-                let (n, lp, t) = self.header(k)?;
-                let v = self.expr(b.value)?;
+                let head = self.header(k)?;
+                let value = self.expr(b.value)?;
                 let all = self.name_list(&b.all)?;
-                if matches!(k.kind, Kind::Thm(_)) {
-                    self.line(&format!(r#"{{"thm":{{"all":{all},"levelParams":{lp},"name":{n},"type":{t},"value":{v}}}}}"#))
+                self.decl(if matches!(k.kind, Kind::Thm(_)) {
+                    Decl::Thm { head, value, all }
                 } else {
-                    self.line(&format!(
-                        r#"{{"opaque":{{"all":{all},"isUnsafe":false,"levelParams":{lp},"name":{n},"type":{t},"value":{v}}}}}"#
-                    ))
-                }
+                    Decl::Opaque {
+                        head,
+                        value,
+                        is_unsafe: false,
+                        all: Some(all),
+                    }
+                })
             }
             Kind::Quot(_) => self.quot(),
             Kind::Induct(ind) => self.inductive(k, ind),
@@ -452,12 +318,12 @@ impl<'a, W: Write> Exporter<'a, W> {
         }
     }
 
-    fn header(&mut self, k: &Const) -> Result<(u32, String, u32)> {
-        Ok((
-            self.name(k.name)?,
-            self.level_params(&k.level_params)?,
-            self.expr(k.ty)?,
-        ))
+    fn header(&mut self, k: &Const) -> Result<Head> {
+        Ok(Head {
+            name: self.name(k.name)?,
+            level_params: self.level_params(&k.level_params)?,
+            ty: self.expr(k.ty)?,
+        })
     }
 
     fn quot(&mut self) -> Result<()> {
@@ -468,20 +334,12 @@ impl<'a, W: Write> Exporter<'a, W> {
         }
         for c in rest.into_iter().flatten() {
             self.visited.insert(c);
-            let (k, kind) = lookup(env, c, "quotient", |k| match k {
+            let (k, &kind) = lookup(env, c, "quotient", |k| match k {
                 Kind::Quot(q) => Some(q),
                 _ => None,
             })?;
-            let (n, lp, t) = self.header(k)?;
-            let kind = match kind {
-                QuotKind::Type => "type",
-                QuotKind::Ctor => "ctor",
-                QuotKind::Lift => "lift",
-                QuotKind::Ind => "ind",
-            };
-            self.line(&format!(
-                r#"{{"quot":{{"kind":"{kind}","levelParams":{lp},"name":{n},"type":{t}}}}}"#
-            ))?;
+            let head = self.header(k)?;
+            self.decl(Decl::Quot { head, kind })?;
         }
         Ok(())
     }
@@ -534,24 +392,26 @@ impl<'a, W: Write> Exporter<'a, W> {
                 self.deps(rule.rhs)?;
             }
         }
-        let mut out = String::from(r#"{"inductive":{"ctors":["#);
-        for (i, &(c, ctor)) in ctors.iter().enumerate() {
+        let mut out_ctors = Vec::with_capacity(ctors.len());
+        for &(c, ctor) in &ctors {
             let Ctor {
                 induct,
                 cidx,
                 num_params,
                 num_fields,
             } = *ctor;
-            let (n, lp, t) = self.header(c)?;
-            let induct = self.name(induct)?;
-            sep(&mut out, i);
-            let _ = write!(
-                out,
-                r#"{{"cidx":{cidx},"induct":{induct},"isUnsafe":false,"levelParams":{lp},"name":{n},"numFields":{num_fields},"numParams":{num_params},"type":{t}}}"#
-            );
+            let head = self.header(c)?;
+            out_ctors.push(IndCtor {
+                head,
+                is_unsafe: false,
+                induct: self.name(induct)?,
+                cidx,
+                num_params,
+                num_fields,
+            });
         }
-        out.push_str(r#"],"recs":["#);
-        for (i, &(r, rec)) in recs.iter().enumerate() {
+        let mut out_recs = Vec::with_capacity(recs.len());
+        for &(r, rec) in &recs {
             let Rec {
                 all,
                 num_params,
@@ -561,26 +421,32 @@ impl<'a, W: Write> Exporter<'a, W> {
                 rules,
                 k,
             } = rec;
-            let (n, lp, t) = self.header(r)?;
+            let head = self.header(r)?;
             let all = self.name_list(all)?;
-            let mut rs = String::new();
-            for (j, rule) in rules.iter().enumerate() {
-                let (ctor, rhs) = (self.name(rule.ctor)?, self.expr(rule.rhs)?);
-                sep(&mut rs, j);
-                let _ = write!(
-                    rs,
-                    r#"{{"ctor":{ctor},"nfields":{},"rhs":{rhs}}}"#,
-                    rule.nfields
-                );
-            }
-            sep(&mut out, i);
-            let _ = write!(
-                out,
-                r#"{{"all":{all},"isUnsafe":false,"k":{k},"levelParams":{lp},"name":{n},"numIndices":{num_indices},"numMinors":{num_minors},"numMotives":{num_motives},"numParams":{num_params},"rules":[{rs}],"type":{t}}}"#
-            );
+            let rules = rules
+                .iter()
+                .map(|rule| {
+                    Ok(IndRule {
+                        ctor: self.name(rule.ctor)?,
+                        nfields: rule.nfields,
+                        rhs: self.expr(rule.rhs)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            out_recs.push(IndRec {
+                head,
+                is_unsafe: false,
+                all,
+                num_params: *num_params,
+                num_indices: *num_indices,
+                num_motives: *num_motives,
+                num_minors: *num_minors,
+                rules,
+                k: *k,
+            });
         }
-        out.push_str(r#"],"types":["#);
-        for (i, &(ty, ind)) in types.iter().enumerate() {
+        let mut out_types = Vec::with_capacity(types.len());
+        for &(ty, ind) in &types {
             let Inductive {
                 num_params,
                 num_indices,
@@ -590,16 +456,25 @@ impl<'a, W: Write> Exporter<'a, W> {
                 is_rec,
                 is_reflexive,
             } = ind;
-            let (n, lp, t) = self.header(ty)?;
+            let head = self.header(ty)?;
             let (all, ctors) = (self.name_list(all)?, self.name_list(ctors)?);
-            sep(&mut out, i);
-            let _ = write!(
-                out,
-                r#"{{"all":{all},"ctors":{ctors},"isRec":{is_rec},"isReflexive":{is_reflexive},"isUnsafe":false,"levelParams":{lp},"name":{n},"numIndices":{num_indices},"numNested":{num_nested},"numParams":{num_params},"type":{t}}}"#
-            );
+            out_types.push(IndType {
+                head,
+                is_unsafe: false,
+                num_params: *num_params,
+                num_indices: *num_indices,
+                all,
+                ctors,
+                num_nested: *num_nested,
+                is_rec: *is_rec,
+                is_reflexive: *is_reflexive,
+            });
         }
-        out.push_str("]}}");
-        self.line(&out)
+        self.decl(Decl::Inductive {
+            types: out_types,
+            ctors: out_ctors,
+            recs: out_recs,
+        })
     }
 }
 
@@ -615,34 +490,4 @@ fn lookup<'e, T>(
         .get(&n)
         .and_then(|c| Some((c, pick(&c.kind)?)))
         .ok_or_else(|| corrupt(format!("{} is not a known {what}", env.display(n))))
-}
-
-const fn fresh(next: &mut u32) -> u32 {
-    *next += 1;
-    *next - 1
-}
-
-const fn binder(b: Binder) -> &'static str {
-    match b {
-        Binder::Default => "default",
-        Binder::Implicit => "implicit",
-        Binder::StrictImplicit => "strictImplicit",
-        Binder::InstImplicit => "instImplicit",
-    }
-}
-
-fn sep(s: &mut String, i: usize) {
-    if i > 0 {
-        s.push(',');
-    }
-}
-
-fn json_list(ids: &[u32]) -> String {
-    let mut s = String::from("[");
-    for (i, id) in ids.iter().enumerate() {
-        sep(&mut s, i);
-        let _ = write!(s, "{id}");
-    }
-    s.push(']');
-    s
 }

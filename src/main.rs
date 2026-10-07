@@ -1,6 +1,10 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use olean_export::{resolve, search_path, with_big_stack, Env, Exporter, Summary};
+use olean_export::{
+    blean::{self, Blean},
+    ndjson::{self, Ndjson},
+    resolve, search_path, with_big_stack, Env, Exporter, NameId, Sink, Summary,
+};
 use std::{
     cell::Cell,
     error::Error,
@@ -43,9 +47,20 @@ struct Cli {
     /// Decode modules on N threads [default: all cores]
     #[arg(short, long, value_name = "N")]
     jobs: Option<usize>,
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = Format::Ndjson)]
+    format: Format,
     /// No progress bars or summary
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// lean4export 3.1.0 NDJSON
+    Ndjson,
+    /// The same records in binary, see docs/README.md
+    Blean,
 }
 
 #[derive(Debug, Subcommand)]
@@ -58,6 +73,14 @@ enum Command {
         /// List every constant with its kind
         #[arg(short, long)]
         consts: bool,
+    },
+    /// Convert an export between NDJSON and blean, whichever the input is not
+    Convert {
+        /// An NDJSON or blean export
+        input: PathBuf,
+        /// Write to FILE instead of stdout
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -82,6 +105,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
         Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
+        Some(Command::Convert { input, output }) => convert(input, output.as_ref()),
         None => with_big_stack(|| run(&cli)),
     };
     match result {
@@ -258,34 +282,70 @@ fn run(cli: &Cli) -> Res {
         Some(targets.len() as u64),
         "{spinner:.cyan} emitting [{elapsed}] [{bar:30.cyan/blue}] {human_pos}/{human_len} {msg}",
     );
-    let mut ex = Exporter::new(&env, out);
-    ex.meta()?;
-    for (i, &c) in targets.iter().enumerate() {
-        ex.constant(c)?;
-        if i % 256 == 0 {
-            pb.set_position(i as u64);
-            pb.set_message(HumanBytes(bytes.get()).to_string());
-        }
-    }
-    let counts = ex.counts();
-    ex.finish()?;
+    let tick = |i: usize| {
+        pb.set_position(i as u64);
+        pb.set_message(HumanBytes(bytes.get()).to_string());
+    };
+    let counts = match cli.format {
+        Format::Ndjson => export(Exporter::new(&env, out), &targets, tick)?,
+        Format::Blean => export(Exporter::with_sink(&env, Blean::new(out)), &targets, tick)?,
+    };
     pb.finish_and_clear();
 
     if !cli.quiet {
         let ms = start.elapsed().saturating_sub(loaded).as_millis().max(1);
         let rate = u64::try_from(u128::from(bytes.get()) * 1000 / ms).unwrap_or(u64::MAX);
         eprintln!(
-            "{} modules, {} constants decoded in {:.2}s\n{} of NDJSON ({} names, {} levels, {} exprs) in {:.2}s total, {}/s",
+            "{} modules, {} constants decoded in {:.2}s\n{} of {} ({} names, {} levels, {} exprs) in {:.2}s total, {}/s",
             HumanCount(env.modules.len() as u64),
             HumanCount(env.consts.len() as u64),
             loaded.as_secs_f64(),
             HumanBytes(bytes.get()),
+            match cli.format {
+                Format::Ndjson => "NDJSON",
+                Format::Blean => "blean",
+            },
             HumanCount(counts.names.into()),
             HumanCount(counts.levels.into()),
             HumanCount(counts.exprs.into()),
             start.elapsed().as_secs_f64(),
             HumanBytes(rate),
         );
+    }
+    Ok(())
+}
+
+fn export<S: Sink>(
+    mut ex: Exporter<'_, S>,
+    targets: &[NameId],
+    tick: impl Fn(usize),
+) -> Result<olean_export::Counts, Box<dyn Error + Send + Sync>> {
+    ex.meta()?;
+    for (i, &c) in targets.iter().enumerate() {
+        ex.constant(c)?;
+        if i % 256 == 0 {
+            tick(i);
+        }
+    }
+    let counts = ex.counts();
+    ex.finish()?;
+    Ok(counts)
+}
+
+fn convert(input: &PathBuf, output: Option<&PathBuf>) -> Res {
+    let file = File::open(input)?;
+    // SAFETY: the export is only read, and is not expected to change while converting.
+    #[allow(unsafe_code)]
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    let sink: Box<dyn Write> = match output {
+        Some(path) => Box::new(File::create(path)?),
+        None => Box::new(io::stdout().lock()),
+    };
+    let out = BufWriter::with_capacity(1 << 20, sink);
+    if blean::sniff(&map) {
+        blean::read(&map, Ndjson::new(out))?;
+    } else {
+        ndjson::read(&map[..], Blean::new(out))?;
     }
     Ok(())
 }

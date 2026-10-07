@@ -39,6 +39,12 @@ Checked 39 declarations with no errors
 
 Without `-c` it exports every constant reachable from the module, like `lean4export Hello`.
 
+## BLean
+
+Blean is a new binary format that is more efficient to mmap and read than NDJSON.
+
+Add `-f blean` for the same stream in a compact binary form, see [docs/README.md](docs/README.md).
+
 ## Performance
 
 Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`.

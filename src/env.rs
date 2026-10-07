@@ -6,6 +6,7 @@ use hashbrown::{hash_table::Entry, HashTable};
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     hash::{BuildHasher, Hash},
@@ -70,7 +71,8 @@ pub enum Level {
     Param(NameId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Binder {
     Default,
     Implicit,
@@ -156,14 +158,16 @@ impl Expr {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Hints {
     Opaque,
     Abbrev,
     Regular(u32),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QuotKind {
     Type,
     Ctor,

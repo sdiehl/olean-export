@@ -29,6 +29,10 @@ pub enum Error {
     #[error("{}: {source}", path.display())]
     File { path: PathBuf, source: Box<Self> },
     #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("blean: {0}")]
+    Postcard(#[from] postcard::Error),
+    #[error(transparent)]
     Threads(#[from] rayon::ThreadPoolBuildError),
 }
 
