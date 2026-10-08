@@ -45,6 +45,10 @@ Blean is a new binary format that is more efficient to mmap and read than NDJSON
 
 Add `-f blean` for the same stream in a compact binary form, see [docs/README.md](docs/README.md).
 
+```bash
+lake env olean-export Hello -c double_two -f blean -o hello.blean
+```
+
 ## Performance
 
 Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`.
