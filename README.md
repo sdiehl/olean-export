@@ -26,15 +26,17 @@ theorem double_two : double 2 = 4 := rfl
 lean -o Hello.olean Hello.lean
 ```
 
-Export one theorem with everything it depends on, then check it with a kernel. Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
+Export one theorem with everything it depends on, then check it with a kernel such as [nano-lean](https://github.com/sdiehl/nano-lean). Inside a Lake project, `lake env` sets `LEAN_PATH` for you, so you can run:
 
 ```bash
 $ lake env olean-export Hello -c double_two -o hello.ndjson
 654 modules, 65,373 constants decoded in 1.41s
 36.82 KiB of NDJSON (138 names, 16 levels, 490 exprs) in 1.41s total, 11.99 MiB/s
 
-$ sokonanoda --nat-extension --print-success-message --stdin < hello.ndjson
-Checked 39 declarations with no errors
+$ nl-fast hello.ndjson
+import 1.23ms arena 0 MiB, 39 decls 490 exprs 138 names 16 levels
+experimental checks 967.17µs: 39 attempted, 0 failures, 0 fallbacks
+bridged quot 0 ind 7 ctor 8 rec 7
 ```
 
 Without `-c` it exports every constant reachable from the module, like `lean4export Hello`.
