@@ -59,7 +59,7 @@ struct Cli {
 enum Format {
     /// lean4export 3.1.0 NDJSON
     Ndjson,
-    /// The same records in binary, see docs/README.md
+    /// The same records in binary, see docs/BLEAN.md
     Blean,
 }
 

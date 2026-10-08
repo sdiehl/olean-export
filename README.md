@@ -45,7 +45,7 @@ Without `-c` it exports every constant reachable from the module, like `lean4exp
 
 Blean is a new binary format that is more efficient to mmap and read than NDJSON.
 
-Add `-f blean` for the same stream in a compact binary form, see [docs/README.md](docs/README.md).
+Add `-f blean` for the same stream in a compact binary form, see [docs/BLEAN.md](docs/BLEAN.md).
 
 ```bash
 lake env olean-export Hello -c double_two -f blean -o hello.blean
