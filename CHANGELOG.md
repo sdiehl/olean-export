@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-08)
 
 - Add `inspect` subcommand summarizing an olean's imports, constants and bytes per section.
 - Add `-f blean`, a postcard binary form of the export with per-expression hashes, and `convert` between it and NDJSON.
