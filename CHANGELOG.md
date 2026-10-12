@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (2026-10-12)
+
+- Walk terms and constant dependencies on explicit worklists, so no term depth or dependency chain can overflow a thread stack.
+- Report a cyclic object graph as a corrupt olean instead of looping or overflowing.
+- Remove `with_big_stack` and the 1 GB decoding and export threads it required. Callers can drop the wrapper and run `Exporter` on any thread.
+
 ## 0.2.0 (2026-10-08)
 
 - Add `inspect` subcommand summarizing an olean's imports, constants and bytes per section.
