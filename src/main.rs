@@ -3,7 +3,7 @@ use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, Progres
 use olean_export::{
     blean::{self, Blean},
     ndjson::{self, Ndjson},
-    resolve, search_path, with_big_stack, Env, Exporter, NameId, Sink, Summary,
+    resolve, search_path, Env, Exporter, NameId, Sink, Summary,
 };
 use std::{
     cell::Cell,
@@ -106,7 +106,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
         Some(Command::Convert { input, output }) => convert(input, output.as_ref()),
-        None => with_big_stack(|| run(&cli)),
+        None => run(&cli),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

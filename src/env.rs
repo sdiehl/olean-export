@@ -559,7 +559,6 @@ impl Env {
         };
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs.max(1))
-            .stack_size(crate::STACK)
             .build()?;
         let (done, consts) = (AtomicUsize::new(0), AtomicUsize::new(0));
         let decoded = pool.install(|| {
@@ -731,6 +730,9 @@ struct Decoder<'a> {
     memo: Vec<u32>,
 }
 
+/// The memo mark of an expression whose subterms are still being decoded.
+const PENDING: u32 = u32::MAX;
+
 impl Decoder<'_> {
     fn run(&mut self) -> Result<()> {
         let img = self.img;
@@ -799,73 +801,106 @@ impl Decoder<'_> {
         Ok(self.remember(slot, id))
     }
 
-    fn expr(&mut self, o: u64) -> Result<ExprId> {
-        let (slot, seen) = self.seen(o)?;
-        if let Some(id) = seen {
-            return Ok(id);
-        }
+    /// Decode `root` after its subterms, on a worklist rather than the stack. A slot is
+    /// [`PENDING`] while its subterms are queued, which catches cyclic images.
+    fn expr(&mut self, root: u64) -> Result<ExprId> {
         let img = self.img;
-        let f = |i| img.field(o, i);
-        let binder = || {
-            Ok::<_, Error>(match img.scalar_u8(o, 8)? {
-                0 => Binder::Default,
-                1 => Binder::Implicit,
-                2 => Binder::StrictImplicit,
-                _ => Binder::InstImplicit,
-            })
-        };
-        let e = match img.tag(o)? {
-            0 => Expr::BVar(small_nat(f(0)?)?),
-            3 => Expr::Sort(self.level(f(0)?)?),
-            4 => {
-                let us = img.list(f(1)?)?;
-                let us = us
-                    .into_iter()
-                    .map(|l| self.level(l))
-                    .collect::<Result<_>>()?;
-                Expr::Const(self.name(f(0)?)?, us)
-            }
-            5 => Expr::App(self.expr(f(0)?)?, self.expr(f(1)?)?),
-            6 => Expr::Lam(
-                self.name(f(0)?)?,
-                self.expr(f(1)?)?,
-                self.expr(f(2)?)?,
-                binder()?,
-            ),
-            7 => Expr::Pi(
-                self.name(f(0)?)?,
-                self.expr(f(1)?)?,
-                self.expr(f(2)?)?,
-                binder()?,
-            ),
-            8 => Expr::Let(
-                self.name(f(0)?)?,
-                self.expr(f(1)?)?,
-                self.expr(f(2)?)?,
-                self.expr(f(3)?)?,
-            ),
-            9 => {
-                let lit = f(0)?;
-                let val = img.field(lit, 0)?;
-                if img.tag(lit)? == 0 {
-                    Expr::Nat(img.nat_decimal(val)?.into())
-                } else {
-                    Expr::Str(img.str(val)?.into())
+        let mut work = vec![(root, false)];
+        while let Some((o, ready)) = work.pop() {
+            let slot = img.slot(o)?;
+            let f = |i| img.field(o, i);
+            let tag = img.tag(o)?;
+            if !ready {
+                match self.memo[slot] {
+                    0 => {}
+                    PENDING => return Err(corrupt("cyclic expression")),
+                    _ => continue,
                 }
+                self.memo[slot] = PENDING;
+                work.push((o, true));
+                let subs: &[u64] = match tag {
+                    5 => &[0, 1],
+                    6 | 7 => &[1, 2],
+                    8 => &[1, 2, 3],
+                    10 => &[1],
+                    11 => &[2],
+                    _ => &[],
+                };
+                for &i in subs.iter().rev() {
+                    work.push((f(i)?, false));
+                }
+                continue;
             }
-            10 => {
-                let id = self.expr(f(1)?)?;
-                return Ok(self.remember(slot, id));
-            }
-            11 => Expr::Proj(self.name(f(0)?)?, small_nat(f(1)?)?, self.expr(f(2)?)?),
-            t => {
-                return Err(corrupt(format!(
-                    "unexpected expression tag {t} (free or meta variable in a declaration)"
-                )))
-            }
-        };
-        let id = self.tables.exprs.intern(e, self.rank, self.cursor);
-        Ok(self.remember(slot, id))
+            let binder = || {
+                Ok::<_, Error>(match img.scalar_u8(o, 8)? {
+                    0 => Binder::Default,
+                    1 => Binder::Implicit,
+                    2 => Binder::StrictImplicit,
+                    _ => Binder::InstImplicit,
+                })
+            };
+            let e = match tag {
+                0 => Expr::BVar(small_nat(f(0)?)?),
+                3 => Expr::Sort(self.level(f(0)?)?),
+                4 => {
+                    let us = img.list(f(1)?)?;
+                    let us = us
+                        .into_iter()
+                        .map(|l| self.level(l))
+                        .collect::<Result<_>>()?;
+                    Expr::Const(self.name(f(0)?)?, us)
+                }
+                5 => Expr::App(self.done(f(0)?)?, self.done(f(1)?)?),
+                6 => Expr::Lam(
+                    self.name(f(0)?)?,
+                    self.done(f(1)?)?,
+                    self.done(f(2)?)?,
+                    binder()?,
+                ),
+                7 => Expr::Pi(
+                    self.name(f(0)?)?,
+                    self.done(f(1)?)?,
+                    self.done(f(2)?)?,
+                    binder()?,
+                ),
+                8 => Expr::Let(
+                    self.name(f(0)?)?,
+                    self.done(f(1)?)?,
+                    self.done(f(2)?)?,
+                    self.done(f(3)?)?,
+                ),
+                9 => {
+                    let lit = f(0)?;
+                    let val = img.field(lit, 0)?;
+                    if img.tag(lit)? == 0 {
+                        Expr::Nat(img.nat_decimal(val)?.into())
+                    } else {
+                        Expr::Str(img.str(val)?.into())
+                    }
+                }
+                10 => {
+                    let id = self.done(f(1)?)?;
+                    self.remember(slot, id);
+                    continue;
+                }
+                11 => Expr::Proj(self.name(f(0)?)?, small_nat(f(1)?)?, self.done(f(2)?)?),
+                t => {
+                    return Err(corrupt(format!(
+                        "unexpected expression tag {t} (free or meta variable in a declaration)"
+                    )))
+                }
+            };
+            let id = self.tables.exprs.intern(e, self.rank, self.cursor);
+            self.remember(slot, id);
+        }
+        self.done(root)
+    }
+
+    /// The id of an already decoded subterm.
+    fn done(&self, o: u64) -> Result<ExprId> {
+        self.seen(o)?
+            .1
+            .ok_or_else(|| corrupt("subterm decoded out of order"))
     }
 
     fn constant(&mut self, info: u64) -> Result<()> {

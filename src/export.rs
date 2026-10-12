@@ -1,7 +1,7 @@
 use crate::{
     env::{
-        Const, Ctor, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name, NameId, Rec, ANON,
-        ZERO,
+        Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name,
+        NameId, Rec, ANON, ZERO,
     },
     error::{corrupt, Result},
     ndjson::Ndjson,
@@ -16,9 +16,6 @@ const UNSEEN: u32 = u32::MAX;
 
 /// Streams an [`Env`] in lean4export 3.1.0 order to a [`Sink`], NDJSON by default. Ids are
 /// assigned on first use and every record only refers to records already written.
-///
-/// Exporting recurses once per nested subterm, which overflows the default stack on large
-/// libraries such as Mathlib, so run it inside [`crate::with_big_stack`].
 #[derive(Debug)]
 pub struct Exporter<'a, S: Sink> {
     env: &'a Env,
@@ -32,6 +29,39 @@ pub struct Exporter<'a, S: Sink> {
     nat: Option<NameId>,
     str_deps: [Option<NameId>; 2],
     quot: [Option<NameId>; 5],
+}
+
+/// One step of [`Exporter::constant`]'s depth-first walk over dependencies.
+enum Task {
+    Const(NameId),
+    Scan(ExprId),
+    Scanned(ExprId),
+    Emit(NameId),
+}
+
+/// The constants of one mutual inductive block.
+struct Family<'e> {
+    types: Vec<(&'e Const, &'e Inductive)>,
+    ctors: Vec<(&'e Const, &'e Ctor)>,
+    recs: Vec<(&'e Const, &'e Rec)>,
+}
+
+impl<'e> Family<'e> {
+    fn consts(&self) -> impl DoubleEndedIterator<Item = &'e Const> + '_ {
+        let (t, c, r) = (&self.types, &self.ctors, &self.recs);
+        let ctors = c.iter().map(|&(k, _)| k);
+        let recs = r.iter().map(|&(k, _)| k);
+        t.iter().map(|&(k, _)| k).chain(ctors).chain(recs)
+    }
+
+    /// Every term of the block, in the order lean4export visits them.
+    fn terms(&self) -> impl DoubleEndedIterator<Item = ExprId> + '_ {
+        let rules = self
+            .recs
+            .iter()
+            .flat_map(|(_, r)| r.rules.iter().map(|rule| rule.rhs));
+        self.consts().map(|k| k.ty).chain(rules)
+    }
 }
 
 impl<'a, W: Write> Exporter<'a, Ndjson<W>> {
@@ -150,80 +180,97 @@ impl<'a, S: Sink> Exporter<'a, S> {
         Ok(id)
     }
 
-    fn expr(&mut self, e: ExprId) -> Result<u32> {
-        if self.exprs[e.index()] != UNSEEN {
-            return Ok(self.exprs[e.index()]);
-        }
+    /// Export `root` after its subterms. The worklist visits each term twice: first to
+    /// export the names and levels it mentions and queue its subterms, then to write it.
+    fn expr(&mut self, root: ExprId) -> Result<u32> {
         let env = self.env;
-        let r = match &env.exprs[e] {
-            Expr::BVar(i) => Record::BVar(*i),
-            Expr::Sort(l) => Record::Sort(self.level(*l)?),
-            Expr::Const(n, us) => Record::Const {
-                name: self.name(*n)?,
-                us: us.iter().map(|&u| self.level(u)).collect::<Result<_>>()?,
-            },
-            Expr::App(f, a) => Record::App {
-                fun: self.expr(*f)?,
-                arg: self.expr(*a)?,
-            },
-            Expr::Lam(n, t, b, bi) => Record::Lam(self.binding(*n, *t, *b, *bi)?),
-            Expr::Pi(n, t, b, bi) => Record::Pi(self.binding(*n, *t, *b, *bi)?),
-            Expr::Let(n, t, v, b) => {
-                let (n, t, v, b) = (
-                    self.name(*n)?,
-                    self.expr(*t)?,
-                    self.expr(*v)?,
-                    self.expr(*b)?,
-                );
+        let mut work = vec![(root, false)];
+        while let Some((e, ready)) = work.pop() {
+            if self.exprs[e.index()] != UNSEEN {
+                continue;
+            }
+            let x = &env.exprs[e];
+            if !ready {
+                work.push((e, true));
+                match x {
+                    Expr::BVar(_) => {}
+                    Expr::Sort(l) => {
+                        self.level(*l)?;
+                    }
+                    Expr::Const(n, us) => {
+                        self.name(*n)?;
+                        us.iter().try_for_each(|&u| self.level(u).map(drop))?;
+                    }
+                    Expr::App(f, a) => work.extend([(*a, false), (*f, false)]),
+                    Expr::Lam(n, t, b, _) | Expr::Pi(n, t, b, _) => {
+                        self.name(*n)?;
+                        work.extend([(*b, false), (*t, false)]);
+                    }
+                    Expr::Let(n, t, v, b) => {
+                        self.name(*n)?;
+                        work.extend([(*b, false), (*v, false), (*t, false)]);
+                    }
+                    Expr::Nat(_) => {
+                        if let Some(nat) = self.nat {
+                            self.constant(nat)?;
+                        }
+                    }
+                    Expr::Str(_) => {
+                        for c in self.str_deps.into_iter().flatten() {
+                            self.constant(c)?;
+                        }
+                    }
+                    Expr::Proj(n, _, x) => {
+                        self.name(*n)?;
+                        work.push((*x, false));
+                    }
+                }
+                continue;
+            }
+            let (names, levels, exprs) = (&self.names, &self.levels, &self.exprs);
+            let name = |n: &NameId| names[n.index()];
+            let level = |l: &LevelId| levels[l.index()];
+            let expr = |e: &ExprId| exprs[e.index()];
+            let bind = |n: &NameId, t: &ExprId, b: &ExprId, bi: &Binder| Binding {
+                info: *bi,
+                name: name(n),
+                ty: expr(t),
+                body: expr(b),
+            };
+            let r = match x {
+                Expr::BVar(i) => Record::BVar(*i),
+                Expr::Sort(l) => Record::Sort(level(l)),
+                Expr::Const(n, us) => Record::Const {
+                    name: name(n),
+                    us: us.iter().map(level).collect(),
+                },
+                Expr::App(f, a) => Record::App {
+                    fun: expr(f),
+                    arg: expr(a),
+                },
+                Expr::Lam(n, t, b, bi) => Record::Lam(bind(n, t, b, bi)),
+                Expr::Pi(n, t, b, bi) => Record::Pi(bind(n, t, b, bi)),
                 // Lean marks most `let`s nondep, but lean4export writes false for all of
                 // them so that terms differing only in the flag share one index.
-                Record::Let {
-                    name: n,
-                    ty: t,
-                    value: v,
-                    body: b,
+                Expr::Let(n, t, v, b) => Record::Let {
+                    name: name(n),
+                    ty: expr(t),
+                    value: expr(v),
+                    body: expr(b),
                     nondep: false,
-                }
-            }
-            Expr::Nat(v) => {
-                if let Some(nat) = self.nat {
-                    self.constant(nat)?;
-                }
-                Record::Nat(v.as_ref().into())
-            }
-            Expr::Str(v) => {
-                for c in self.str_deps.into_iter().flatten() {
-                    self.constant(c)?;
-                }
-                Record::Str(v.as_ref().into())
-            }
-            Expr::Proj(n, i, x) => {
-                let (n, x) = (self.name(*n)?, self.expr(*x)?);
-                Record::Proj {
-                    type_name: n,
+                },
+                Expr::Nat(v) => Record::Nat(v.as_ref().into()),
+                Expr::Str(v) => Record::Str(v.as_ref().into()),
+                Expr::Proj(n, i, x) => Record::Proj {
+                    type_name: name(n),
                     idx: *i,
-                    struct_: x,
-                }
-            }
-        };
-        let id = self.emit(&r)?;
-        self.exprs[e.index()] = id;
-        Ok(id)
-    }
-
-    fn binding(
-        &mut self,
-        n: NameId,
-        t: ExprId,
-        b: ExprId,
-        info: crate::env::Binder,
-    ) -> Result<Binding> {
-        Ok(Binding {
-            info,
-            name: self.name(n)?,
-            ty: self.expr(t)?,
-            body: self.expr(b)?,
-        })
+                    struct_: expr(x),
+                },
+            };
+            let id = self.emit(&r)?;
+            self.exprs[e.index()] = id;
+        }
+        Ok(self.exprs[root.index()])
     }
 
     /// Write a name, level or expression record and return its id.
@@ -239,40 +286,73 @@ impl<'a, S: Sink> Exporter<'a, S> {
         self.sink.record(&Record::Decl(d))
     }
 
-    fn deps(&mut self, e: ExprId) -> Result<()> {
-        if self.scanned[e.index()] {
-            return Ok(());
-        }
-        match &self.env.exprs[e] {
-            Expr::Const(n, _) => self.constant(*n)?,
-            Expr::App(a, b) | Expr::Lam(_, a, b, _) | Expr::Pi(_, a, b, _) => {
-                self.deps(*a)?;
-                self.deps(*b)?;
+    /// Export a constant and, first, everything it mentions. Dependencies are walked
+    /// depth-first on an explicit stack, so no term depth or dependency chain can overflow
+    /// the thread's stack.
+    pub fn constant(&mut self, c: NameId) -> Result<()> {
+        let env = self.env;
+        let mut work = vec![Task::Const(c)];
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Scan(e) => {
+                    if self.scanned[e.index()] {
+                        continue;
+                    }
+                    work.push(Task::Scanned(e));
+                    match &env.exprs[e] {
+                        Expr::Const(n, _) => work.push(Task::Const(*n)),
+                        Expr::App(a, b) | Expr::Lam(_, a, b, _) | Expr::Pi(_, a, b, _) => {
+                            work.extend([Task::Scan(*b), Task::Scan(*a)]);
+                        }
+                        Expr::Let(_, t, v, b) => {
+                            work.extend([Task::Scan(*b), Task::Scan(*v), Task::Scan(*t)]);
+                        }
+                        Expr::Proj(_, _, x) => work.push(Task::Scan(*x)),
+                        Expr::BVar(_) | Expr::Sort(_) | Expr::Nat(_) | Expr::Str(_) => {}
+                    }
+                }
+                Task::Scanned(e) => self.scanned[e.index()] = true,
+                Task::Const(c) => {
+                    if !self.visited.insert(c) {
+                        continue;
+                    }
+                    let Some(k) = env.consts.get(&c) else {
+                        continue;
+                    };
+                    match &k.kind {
+                        Kind::Axiom => work.extend([Task::Emit(c), Task::Scan(k.ty)]),
+                        Kind::Defn(Defn { value, .. })
+                        | Kind::Thm(Body { value, .. })
+                        | Kind::Opaque(Body { value, .. }) => {
+                            work.extend([Task::Emit(c), Task::Scan(*value), Task::Scan(k.ty)]);
+                        }
+                        Kind::Quot(_) => {
+                            work.push(Task::Emit(c));
+                            work.extend(self.quot[0].map(Task::Const));
+                        }
+                        Kind::Induct(ind) => {
+                            let fam = self.family(k, ind)?;
+                            self.visited.extend(fam.consts().map(|k| k.name));
+                            work.push(Task::Emit(c));
+                            work.extend(fam.terms().rev().map(Task::Scan));
+                        }
+                        Kind::Ctor(ctor) => work.push(Task::Const(ctor.induct)),
+                        Kind::Rec(rec) => {
+                            work.extend(rec.all.iter().rev().map(|&i| Task::Const(i)));
+                        }
+                    }
+                }
+                Task::Emit(c) => self.write(c)?,
             }
-            Expr::Let(_, t, v, b) => {
-                self.deps(*t)?;
-                self.deps(*v)?;
-                self.deps(*b)?;
-            }
-            Expr::Proj(_, _, x) => self.deps(*x)?,
-            Expr::BVar(_) | Expr::Sort(_) | Expr::Nat(_) | Expr::Str(_) => {}
         }
-        self.scanned[e.index()] = true;
         Ok(())
     }
 
-    /// Export a constant and, first, everything it mentions.
-    pub fn constant(&mut self, c: NameId) -> Result<()> {
-        if !self.visited.insert(c) {
-            return Ok(());
-        }
-        let env = self.env;
-        let Some(k) = env.consts.get(&c) else {
-            return Ok(());
-        };
+    /// Write the declaration of `c`, whose dependencies are already out.
+    fn write(&mut self, c: NameId) -> Result<()> {
+        let k = &self.env.consts[&c];
         match &k.kind {
             Kind::Axiom => {
-                self.deps(k.ty)?;
                 let head = self.header(k)?;
                 self.decl(Decl::Axiom {
                     head,
@@ -281,8 +361,6 @@ impl<'a, S: Sink> Exporter<'a, S> {
                 })
             }
             Kind::Defn(d) => {
-                self.deps(k.ty)?;
-                self.deps(d.value)?;
                 let head = self.header(k)?;
                 let value = self.expr(d.value)?;
                 let all = self.name_list(&d.all)?;
@@ -295,8 +373,6 @@ impl<'a, S: Sink> Exporter<'a, S> {
                 })
             }
             Kind::Thm(b) | Kind::Opaque(b) => {
-                self.deps(k.ty)?;
-                self.deps(b.value)?;
                 let head = self.header(k)?;
                 let value = self.expr(b.value)?;
                 let all = self.name_list(&b.all)?;
@@ -313,8 +389,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
             }
             Kind::Quot(_) => self.quot(),
             Kind::Induct(ind) => self.inductive(k, ind),
-            Kind::Ctor(ctor) => self.constant(ctor.induct),
-            Kind::Rec(rec) => rec.all.iter().try_for_each(|&i| self.constant(i)),
+            Kind::Ctor(_) | Kind::Rec(_) => unreachable!("exported through their inductive"),
         }
     }
 
@@ -328,10 +403,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     fn quot(&mut self) -> Result<()> {
         let env = self.env;
-        let [eq, rest @ ..] = self.quot;
-        if let Some(eq) = eq {
-            self.constant(eq)?;
-        }
+        let [_, rest @ ..] = self.quot;
         for c in rest.into_iter().flatten() {
             self.visited.insert(c);
             let (k, &kind) = lookup(env, c, "quotient", |k| match k {
@@ -344,7 +416,8 @@ impl<'a, S: Sink> Exporter<'a, S> {
         Ok(())
     }
 
-    fn inductive(&mut self, base: &Const, ind: &Inductive) -> Result<()> {
+    /// The mutual block of `base`: its types, their constructors and their recursors.
+    fn family(&self, base: &Const, ind: &Inductive) -> Result<Family<'a>> {
         let env = self.env;
         let types = ind
             .all
@@ -356,21 +429,16 @@ impl<'a, S: Sink> Exporter<'a, S> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut ctors = Vec::new();
-        for &(t, i) in &types {
-            for &c in &i.ctors {
-                ctors.push(lookup(env, c, "constructor", |k| match k {
+        let ctors = types
+            .iter()
+            .flat_map(|(_, i)| &i.ctors)
+            .map(|&c| {
+                lookup(env, c, "constructor", |k| match k {
                     Kind::Ctor(c) => Some(c),
                     _ => None,
-                })?);
-            }
-            self.visited.insert(t.name);
-            self.deps(t.ty)?;
-        }
-        for &(c, _) in &ctors {
-            self.visited.insert(c.name);
-            self.deps(c.ty)?;
-        }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let recs = env
             .recursors
             .get(&base.name)
@@ -383,15 +451,11 @@ impl<'a, S: Sink> Exporter<'a, S> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        for &(r, _) in &recs {
-            self.visited.insert(r.name);
-            self.deps(r.ty)?;
-        }
-        for (_, rec) in &recs {
-            for rule in &rec.rules {
-                self.deps(rule.rhs)?;
-            }
-        }
+        Ok(Family { types, ctors, recs })
+    }
+
+    fn inductive(&mut self, base: &Const, ind: &Inductive) -> Result<()> {
+        let Family { types, ctors, recs } = self.family(base, ind)?;
         let mut out_ctors = Vec::with_capacity(ctors.len());
         for &(c, ctor) in &ctors {
             let Ctor {

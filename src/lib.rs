@@ -30,18 +30,3 @@ pub use info::Info;
 pub use inspect::{Decl, Import, Section, Summary};
 pub use olean::{Header, SUPPORTED};
 pub use record::{Counts, Record, Sink};
-
-const STACK: usize = 1 << 30;
-
-/// Run `f` on a thread with a stack deep enough for long application spines and binder chains,
-/// re-raising its panic if it has one. [`Exporter`] recurses over terms, so run it inside this.
-pub fn with_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .stack_size(STACK)
-            .spawn_scoped(s, f)
-            .expect("spawn")
-            .join()
-            .unwrap_or_else(|e| std::panic::resume_unwind(e))
-    })
-}
