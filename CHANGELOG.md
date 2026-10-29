@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-10-29)
 
 - Add `Env::open` and `Env::reload`, which redecode only changed modules and keep ids stable.
 - Add `Exporter::suspend`, `resume` and `update` to write only what a reload changed.
