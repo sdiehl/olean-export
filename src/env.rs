@@ -13,9 +13,10 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
         OnceLock,
     },
+    time::SystemTime,
 };
 
 /// The id of a `T` in its table.
@@ -315,6 +316,12 @@ impl<T: Hash + Eq> Shared<T> {
     }
 }
 
+impl<T> Table<T> {
+    fn thaw(self) -> Shared<T> {
+        Shared(self.0.into_iter().map(Mutex::new).collect())
+    }
+}
+
 /// A hash-consing arena: structurally equal nodes get the same id. Ids are interleaved
 /// across shards, so they are nearly but not exactly dense.
 #[derive(Debug)]
@@ -448,13 +455,36 @@ impl SharedExprs {
         Id::new(i)
     }
 
-    fn freeze(self) -> Exprs {
+    /// The expressions, plus the index and ranks [`Env::reload`] needs to intern more.
+    fn freeze(self) -> (Exprs, Vec<HashTable<u32>>, Vec<Vec<u32>>) {
         let n = self.next.into_inner();
-        let chunks = self.chunks.into_iter().take(n).map(|c| {
-            let c = c.into_inner().expect("chunk is published");
-            c.into_inner().nodes
-        });
-        Exprs(chunks.collect())
+        let (nodes, ranks) = self
+            .chunks
+            .into_iter()
+            .take(n)
+            .map(|c| {
+                let c = c.into_inner().expect("chunk is published").into_inner();
+                (c.nodes, c.ranks)
+            })
+            .unzip();
+        let index = self.index.into_iter().map(Mutex::into_inner).collect();
+        (Exprs(nodes), index, ranks)
+    }
+
+    fn thaw(exprs: Exprs, index: Vec<HashTable<u32>>, ranks: Vec<Vec<u32>>) -> Self {
+        let n = exprs.0.len();
+        let chunks: Vec<_> = (0..=u32::MAX as usize / CHUNK)
+            .map(|_| OnceLock::new())
+            .collect();
+        for ((c, nodes), ranks) in chunks.iter().zip(exprs.0).zip(ranks) {
+            c.set(Box::new(Mutex::new(Chunk { nodes, ranks })))
+                .expect("chunk is set once");
+        }
+        Self {
+            index: index.into_iter().map(Mutex::new).collect(),
+            chunks,
+            next: AtomicUsize::new(n),
+        }
     }
 }
 
@@ -504,6 +534,61 @@ struct Module {
     header: Header,
 }
 
+/// The olean parts of a module that exist, with their sizes and modification times.
+type Stamp = Vec<(u64, Option<SystemTime>)>;
+
+const PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
+
+fn stamp(path: &Path) -> Stamp {
+    PARTS
+        .iter()
+        .filter_map(|e| std::fs::metadata(path.with_extension(e)).ok())
+        .map(|m| (m.len(), m.modified().ok()))
+        .collect()
+}
+
+/// A decoded module, as [`Env::reload`] tracks it.
+#[derive(Debug)]
+struct Loaded {
+    module: String,
+    stamp: Stamp,
+    consts: Vec<NameId>,
+    recursors: FxHashMap<NameId, Vec<NameId>>,
+    skipped: usize,
+    header: Header,
+}
+
+/// What an env from [`Env::open`] keeps to decode more modules into its tables.
+#[derive(Debug)]
+struct Live {
+    search: Vec<PathBuf>,
+    roots: Vec<String>,
+    jobs: usize,
+    index: Vec<HashTable<u32>>,
+    ranks: Vec<Vec<u32>>,
+    loaded: Vec<Loaded>,
+}
+
+/// What [`Env::reload`] changed.
+#[derive(Debug, Default)]
+pub struct Reload {
+    /// Modules decoded again, in import order.
+    pub modules: Vec<String>,
+    /// Their constants, in load order.
+    pub consts: Vec<NameId>,
+    /// Constants no longer in the environment.
+    pub removed: Vec<NameId>,
+}
+
+impl Reload {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.modules.is_empty() && self.removed.is_empty()
+    }
+}
+
+static LINEAGE: AtomicU64 = AtomicU64::new(0);
+
 /// Every constant reachable from a set of root modules, in import order.
 #[derive(Debug)]
 pub struct Env {
@@ -516,6 +601,8 @@ pub struct Env {
     pub modules: Vec<String>,
     pub header: Header,
     pub skipped: usize,
+    pub(crate) lineage: u64,
+    live: Option<Box<Live>>,
 }
 
 impl Env {
@@ -536,71 +623,192 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Self> {
-        let mut seen = FxHashSet::default();
-        let mut found = Vec::new();
-        for root in roots {
-            discover(search, root, &mut seen, &mut found)?;
-        }
+        Self::build(search, roots, jobs, progress, false)
+    }
+
+    /// Like [`Env::load_with`], but keeps the expression index so that [`Env::reload`] can
+    /// decode changed modules into the same tables. That costs about 10 bytes per expression.
+    pub fn open(search: &[PathBuf], roots: &[&str], jobs: usize) -> Result<Self> {
+        Self::build(search, roots, jobs, &|_, _| {}, true)
+    }
+
+    fn build(
+        search: &[PathBuf],
+        roots: &[&str],
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+        live: bool,
+    ) -> Result<Self> {
+        let found = discover_all(search, roots)?;
+        let stamps: Vec<Stamp> = found.iter().map(|(_, p)| stamp(p)).collect();
         // Sizing the tables up front avoids rehashing them while they grow. Across Lean and
         // Mathlib there is about one expression per 64 bytes of olean and one name per 1200.
-        let bytes: u64 = found
-            .iter()
-            .flat_map(|(_, p)| {
-                ["olean", "olean.server", "olean.private"].map(|e| p.with_extension(e))
-            })
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
+        let bytes: u64 = stamps.iter().flatten().map(|(len, _)| len).sum();
         let estimate = |per: u64| usize::try_from(bytes / per).unwrap_or(0);
         let tables = Tables {
             names: Shared::new(Name::Anon, estimate(1200)),
             levels: Shared::new(Level::Zero, 0),
             exprs: SharedExprs::new(estimate(64)),
         };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs.max(1))
-            .build()?;
-        let (done, consts) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let decoded = pool.install(|| {
-            found
-                .par_iter()
-                .enumerate()
-                .map_init(
-                    || None,
-                    |cursor, (rank, (_, path))| {
-                        let rank = u32::try_from(rank).expect("module count");
-                        let m = decode(&tables, rank, cursor, path)?;
-                        let n = consts.fetch_add(m.consts.len(), Relaxed) + m.consts.len();
-                        progress(done.fetch_add(1, Relaxed) + 1, n);
-                        Ok(m)
-                    },
-                )
-                .collect::<Result<Vec<_>>>()
-        })?;
+        let paths: Vec<_> = found.iter().map(|(_, p)| p.as_path()).enumerate().collect();
+        let decoded = decode_all(&tables, &paths, jobs, progress);
+        let (exprs, index, ranks) = tables.exprs.freeze();
+        let kept = live.then_some((index, ranks));
+        let decoded = decoded?;
         let mut env = Self {
             names: tables.names.freeze(),
             levels: tables.levels.freeze(),
-            exprs: tables.exprs.freeze(),
+            exprs,
             consts: FxHashMap::default(),
             order: Vec::new(),
             recursors: FxHashMap::default(),
             modules: Vec::new(),
             header: Header::default(),
             skipped: 0,
+            lineage: LINEAGE.fetch_add(1, Relaxed),
+            live: None,
         };
-        for ((module, _), m) in found.into_iter().zip(decoded) {
-            for c in m.consts {
-                env.order.push(c.name);
-                env.consts.insert(c.name, c);
-            }
-            for (ind, recs) in m.recursors {
-                env.recursors.entry(ind).or_default().extend(recs);
-            }
-            env.skipped += m.skipped;
-            env.header = m.header;
-            env.modules.push(module);
+        let loaded: Vec<_> = found
+            .into_iter()
+            .zip(stamps)
+            .zip(decoded)
+            .map(|(((module, _), stamp), m)| env.add(module, stamp, m))
+            .collect();
+        env.index(&loaded);
+        if let Some((index, ranks)) = kept {
+            env.live = Some(Box::new(Live {
+                search: search.to_vec(),
+                roots: roots.iter().map(|&r| r.to_owned()).collect(),
+                jobs,
+                index,
+                ranks,
+                loaded,
+            }));
         }
         Ok(env)
+    }
+
+    fn add(&mut self, module: String, stamp: Stamp, m: Module) -> Loaded {
+        let consts = m.consts.iter().map(|c| c.name).collect();
+        self.consts
+            .extend(m.consts.into_iter().map(|c| (c.name, c)));
+        Loaded {
+            module,
+            stamp,
+            consts,
+            recursors: m.recursors,
+            skipped: m.skipped,
+            header: m.header,
+        }
+    }
+
+    /// Rebuild the load order and everything summed over modules.
+    fn index(&mut self, loaded: &[Loaded]) {
+        self.order = loaded
+            .iter()
+            .flat_map(|l| l.consts.iter().copied())
+            .collect();
+        self.recursors.clear();
+        for (ind, recs) in loaded.iter().flat_map(|l| &l.recursors) {
+            self.recursors.entry(*ind).or_default().extend(recs);
+        }
+        self.modules = loaded.iter().map(|l| l.module.clone()).collect();
+        self.header = loaded.last().map(|l| l.header.clone()).unwrap_or_default();
+        self.skipped = loaded.iter().map(|l| l.skipped).sum();
+    }
+
+    /// Decode again the modules whose oleans changed since the last load, add newly imported
+    /// ones and drop those no longer imported. Every id stays valid and the tables only grow,
+    /// so an [`crate::Exporter`] can resume from a [`crate::Mark`] and write just the
+    /// changes. Binder names, which no kernel reads, may differ from a fresh load.
+    pub fn reload(&mut self) -> Result<Reload> {
+        let mut live = self
+            .live
+            .take()
+            .ok_or_else(|| corrupt("reload needs an environment from Env::open"))?;
+        let r = self.reload_with(&mut live);
+        self.live = Some(live);
+        r
+    }
+
+    fn reload_with(&mut self, live: &mut Live) -> Result<Reload> {
+        let roots: Vec<&str> = live.roots.iter().map(String::as_str).collect();
+        let found = discover_all(&live.search, &roots)?;
+        let stamps: Vec<Stamp> = found.iter().map(|(_, p)| stamp(p)).collect();
+        let fresh: Vec<(usize, &Path)> = {
+            let prev: FxHashMap<&str, &Stamp> = live
+                .loaded
+                .iter()
+                .map(|l| (l.module.as_str(), &l.stamp))
+                .collect();
+            if found.len() == prev.len()
+                && found
+                    .iter()
+                    .zip(&stamps)
+                    .all(|((m, _), s)| prev.get(m.as_str()) == Some(&s))
+            {
+                return Ok(Reload::default());
+            }
+            found
+                .iter()
+                .zip(&stamps)
+                .enumerate()
+                .filter(|(_, ((m, _), s))| prev.get(m.as_str()) != Some(s))
+                .map(|(i, ((_, p), _))| (i, p.as_path()))
+                .collect()
+        };
+        let tables = Tables {
+            names: std::mem::replace(&mut self.names, Table(Vec::new())).thaw(),
+            levels: std::mem::replace(&mut self.levels, Table(Vec::new())).thaw(),
+            exprs: SharedExprs::thaw(
+                std::mem::replace(&mut self.exprs, Exprs(Vec::new())),
+                std::mem::take(&mut live.index),
+                std::mem::take(&mut live.ranks),
+            ),
+        };
+        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {});
+        self.names = tables.names.freeze();
+        self.levels = tables.levels.freeze();
+        (self.exprs, live.index, live.ranks) = tables.exprs.freeze();
+        let mut decoded: FxHashMap<usize, Module> =
+            fresh.iter().map(|&(i, _)| i).zip(decoded?).collect();
+        let mut prev: FxHashMap<String, Loaded> = std::mem::take(&mut live.loaded)
+            .into_iter()
+            .map(|l| (l.module.clone(), l))
+            .collect();
+        let imported: FxHashSet<&str> = found.iter().map(|(m, _)| m.as_str()).collect();
+        let mut stale = Vec::new();
+        prev.retain(|m, l| {
+            let keep =
+                imported.contains(m.as_str()) && !fresh.iter().any(|&(i, _)| found[i].0 == *m);
+            if !keep {
+                stale.append(&mut l.consts);
+            }
+            keep
+        });
+        for c in &stale {
+            self.consts.remove(c);
+        }
+        let mut reload = Reload::default();
+        live.loaded = found
+            .into_iter()
+            .zip(stamps)
+            .enumerate()
+            .map(|(i, ((module, _), stamp))| match decoded.remove(&i) {
+                Some(m) => {
+                    reload.modules.push(module.clone());
+                    reload.consts.extend(m.consts.iter().map(|c| c.name));
+                    self.add(module, stamp, m)
+                }
+                None => prev.remove(&module).expect("unchanged module was loaded"),
+            })
+            .collect();
+        self.index(&live.loaded);
+        reload.removed = stale
+            .into_iter()
+            .filter(|c| !self.consts.contains_key(c))
+            .collect();
+        Ok(reload)
     }
 
     /// The constants `lean4export` exports when given no explicit names.
@@ -657,6 +865,43 @@ fn decode(tables: &Tables, rank: u32, cursor: &mut Option<usize>, path: &Path) -
     };
     dec.run().map_err(at(path))?;
     Ok(dec.module)
+}
+
+/// Decode the modules at `paths`, each with its rank in import order, on `jobs` threads.
+fn decode_all(
+    tables: &Tables,
+    paths: &[(usize, &Path)],
+    jobs: usize,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<Vec<Module>> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs.max(1))
+        .build()?;
+    let (done, consts) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    pool.install(|| {
+        paths
+            .par_iter()
+            .map_init(
+                || None,
+                |cursor, &(rank, path)| {
+                    let rank = u32::try_from(rank).expect("module count");
+                    let m = decode(tables, rank, cursor, path)?;
+                    let n = consts.fetch_add(m.consts.len(), Relaxed) + m.consts.len();
+                    progress(done.fetch_add(1, Relaxed) + 1, n);
+                    Ok(m)
+                },
+            )
+            .collect()
+    })
+}
+
+fn discover_all(search: &[PathBuf], roots: &[&str]) -> Result<Vec<(String, PathBuf)>> {
+    let mut seen = FxHashSet::default();
+    let mut found = Vec::new();
+    for root in roots {
+        discover(search, root, &mut seen, &mut found)?;
+    }
+    Ok(found)
 }
 
 /// Find `module` and its imports, appending them to `out` in import order.

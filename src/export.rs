@@ -1,7 +1,7 @@
 use crate::{
     env::{
         Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name,
-        NameId, Rec, ANON, ZERO,
+        NameId, Rec, Reload, ANON, ZERO,
     },
     error::{corrupt, Result},
     ndjson::Ndjson,
@@ -13,6 +13,37 @@ use rustc_hash::FxHashSet;
 use std::io::Write;
 
 const UNSEEN: u32 = u32::MAX;
+
+/// Where an export stopped, so that a later one on the same [`Env`], reloaded or not,
+/// continues its ids and writes only records the earlier one did not.
+#[derive(Debug)]
+pub struct Mark {
+    lineage: u64,
+    names: Vec<u32>,
+    levels: Vec<u32>,
+    exprs: Vec<u32>,
+    scanned: Vec<bool>,
+    visited: FxHashSet<NameId>,
+    next: Counts,
+}
+
+impl Mark {
+    fn fresh(env: &Env) -> Self {
+        let mut names = vec![UNSEEN; env.names.bound()];
+        let mut levels = vec![UNSEEN; env.levels.bound()];
+        names[ANON.index()] = 0;
+        levels[ZERO.index()] = 0;
+        Self {
+            lineage: env.lineage,
+            names,
+            levels,
+            exprs: Vec::new(),
+            scanned: Vec::new(),
+            visited: FxHashSet::default(),
+            next: Counts::default(),
+        }
+    }
+}
 
 /// Streams an [`Env`] in lean4export 3.1.0 order to a [`Sink`], NDJSON by default. Ids are
 /// assigned on first use and every record only refers to records already written.
@@ -72,20 +103,32 @@ impl<'a, W: Write> Exporter<'a, Ndjson<W>> {
 
 impl<'a, S: Sink> Exporter<'a, S> {
     pub fn with_sink(env: &'a Env, sink: S) -> Self {
-        let mut names = vec![UNSEEN; env.names.bound()];
-        let mut levels = vec![UNSEEN; env.levels.bound()];
-        names[ANON.index()] = 0;
-        levels[ZERO.index()] = 0;
+        Self::from_mark(env, sink, Mark::fresh(env))
+    }
+
+    /// Continue the export `mark` was taken from, on the same environment.
+    pub fn resume(env: &'a Env, sink: S, mark: Mark) -> Result<Self> {
+        if mark.lineage != env.lineage {
+            return Err(corrupt("the mark is from another environment"));
+        }
+        Ok(Self::from_mark(env, sink, mark))
+    }
+
+    fn from_mark(env: &'a Env, sink: S, mut m: Mark) -> Self {
+        m.names.resize(env.names.bound(), UNSEEN);
+        m.levels.resize(env.levels.bound(), UNSEEN);
+        m.exprs.resize(env.exprs.bound(), UNSEEN);
+        m.scanned.resize(env.exprs.bound(), false);
         let find = |s| env.find_name(s);
         Self {
             env,
             sink,
-            names,
-            levels,
-            exprs: vec![UNSEEN; env.exprs.bound()],
-            next: Counts::default(),
-            scanned: vec![false; env.exprs.bound()],
-            visited: FxHashSet::default(),
+            names: m.names,
+            levels: m.levels,
+            exprs: m.exprs,
+            next: m.next,
+            scanned: m.scanned,
+            visited: m.visited,
             nat: find("Nat"),
             str_deps: [find("Char.ofNat"), find("String.ofList")],
             quot: [
@@ -120,9 +163,36 @@ impl<'a, S: Sink> Exporter<'a, S> {
     }
 
     /// Write the end record and hand back the sink's output.
-    pub fn finish(mut self) -> Result<S::Output> {
+    pub fn finish(self) -> Result<S::Output> {
+        self.suspend().map(|(out, _)| out)
+    }
+
+    /// Like [`Exporter::finish`], with a [`Mark`] to [`Exporter::resume`] from.
+    pub fn suspend(mut self) -> Result<(S::Output, Mark)> {
         self.sink.record(&Record::End(self.next))?;
-        self.sink.finish()
+        let mark = Mark {
+            lineage: self.env.lineage,
+            names: self.names,
+            levels: self.levels,
+            exprs: self.exprs,
+            scanned: self.scanned,
+            visited: self.visited,
+            next: self.next,
+        };
+        Ok((self.sink.finish()?, mark))
+    }
+
+    /// After [`Env::reload`], export the reloaded constants again as [`Exporter::all`] would.
+    /// The end record counts every record since the first export.
+    pub fn update(&mut self, r: &Reload) -> Result<()> {
+        for c in r.consts.iter().chain(&r.removed) {
+            self.visited.remove(c);
+        }
+        let env = self.env;
+        r.consts
+            .iter()
+            .filter(|&&c| !env.is_internal(c))
+            .try_for_each(|&c| self.constant(c))
     }
 
     fn name(&mut self, n: NameId) -> Result<u32> {

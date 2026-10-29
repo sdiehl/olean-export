@@ -22,10 +22,10 @@ pub mod record;
 
 pub use env::{
     resolve, search_path, Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Exprs, Hints, Id,
-    Inductive, Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Rule, Table, ANON, ZERO,
+    Inductive, Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Reload, Rule, Table, ANON, ZERO,
 };
 pub use error::{Error, Result};
-pub use export::Exporter;
+pub use export::{Exporter, Mark};
 pub use info::Info;
 pub use inspect::{Decl, Import, Section, Summary};
 pub use olean::{Header, SUPPORTED};
