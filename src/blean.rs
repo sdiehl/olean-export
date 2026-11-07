@@ -9,7 +9,7 @@ use crate::{
     info::{Info, Tracker},
     record::{Counts, Record, Sink, Table},
 };
-use std::io::Write;
+use std::{io::Write, mem};
 
 /// File signature; the final byte is the format version.
 pub const MAGIC: [u8; 8] = *b"BLEAN\0\0\x01";
@@ -37,12 +37,12 @@ impl<W: Write> Blean<W> {
 impl<W: Write> Sink for Blean<W> {
     type Output = W;
 
-    fn record(&mut self, r: &Record<'_>) -> Result<()> {
+    fn record(&mut self, _: Option<u32>, r: &Record<'_>) -> Result<()> {
         if !self.started {
             self.out.write_all(&MAGIC)?;
             self.started = true;
         }
-        let mut buf = postcard::to_extend(r, std::mem::take(&mut self.buf))?;
+        let mut buf = postcard::to_extend(r, mem::take(&mut self.buf))?;
         if let Some(info) = self.info.observe(r)? {
             buf = postcard::to_extend(&info, buf)?;
         }
@@ -137,8 +137,10 @@ impl<'b> Iterator for Entries<'b> {
 
 /// Replay a complete blean file into `sink`.
 pub fn read<S: Sink>(bytes: &[u8], mut sink: S) -> Result<S::Output> {
+    let mut next = Counts::default();
     for e in entries(bytes)? {
-        sink.record(&e?.0)?;
+        let r = e?.0;
+        sink.record(next.assign(&r), &r)?;
     }
     sink.finish()
 }

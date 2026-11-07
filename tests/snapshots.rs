@@ -1,5 +1,5 @@
 use olean_export::{Env, Exporter};
-use std::{fmt::Write as _, path::PathBuf};
+use std::{env, fmt::Write as _, fs, path::PathBuf, process, slice};
 
 fn build() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/build")
@@ -10,17 +10,18 @@ fn export() {
     let build = build();
     insta::glob!("cases/*.lean", |path| {
         let module = path.file_stem().unwrap().to_str().unwrap();
-        let env = Env::load(std::slice::from_ref(&build), &[module]).unwrap();
+        let env = Env::load(slice::from_ref(&build), &[module]).unwrap();
         let mut ex = Exporter::new(&env, Vec::new());
         ex.meta().unwrap();
         ex.all().unwrap();
-        insta::assert_snapshot!(String::from_utf8(ex.finish().unwrap()).unwrap());
+        let out = String::from_utf8(ex.finish().unwrap()).unwrap();
+        insta::assert_snapshot!(out.replace(env!("CARGO_PKG_VERSION"), "[version]"));
     });
 }
 
 #[test]
 fn damaged() {
-    let top = std::fs::read(build().join("Top.olean")).unwrap();
+    let top = fs::read(build().join("Top.olean")).unwrap();
     let mut future = top.clone();
     future[7..13].copy_from_slice(b"4.99.0");
     let cases: [(&str, Vec<u8>); 3] = [
@@ -28,17 +29,17 @@ fn damaged() {
         ("future", future),
         ("garbage", b"not an olean at all".repeat(8)),
     ];
-    let dir = std::env::temp_dir().join(format!("olean-export-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(build().join("Base.olean"), dir.join("Base.olean")).unwrap();
+    let dir = env::temp_dir().join(format!("olean-export-{}", process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(build().join("Base.olean"), dir.join("Base.olean")).unwrap();
     let mut out = String::new();
     for (name, bytes) in cases {
-        std::fs::write(dir.join("Top.olean"), bytes).unwrap();
-        let err = Env::load(std::slice::from_ref(&dir), &["Top"]).unwrap_err();
+        fs::write(dir.join("Top.olean"), bytes).unwrap();
+        let err = Env::load(slice::from_ref(&dir), &["Top"]).unwrap_err();
         let msg = err.to_string().replace(dir.to_str().unwrap(), "$DIR");
         writeln!(out, "{name}: {msg}").unwrap();
     }
-    std::fs::remove_dir_all(&dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
     insta::assert_snapshot!(out);
 }
 
@@ -46,7 +47,7 @@ fn damaged() {
 #[test]
 fn statement() {
     let build = build();
-    let search = std::slice::from_ref(&build);
+    let search = slice::from_ref(&build);
     let mut out = String::new();
     for (module, consts) in [
         ("Top", &["N.add_zero", "letty", "Even"][..]),

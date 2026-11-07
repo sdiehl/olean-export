@@ -3,13 +3,15 @@ use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, Progres
 use olean_export::{
     blean::{self, Blean},
     ndjson::{self, Ndjson},
-    resolve, search_path, Env, Exporter, NameId, Sink, Summary,
+    resolve, search_path, statement, Env, Exporter, NameId, Sink, Summary,
 };
 use std::{
     cell::Cell,
+    cmp::Reverse,
     error::Error,
     fs::File,
     io::{self, BufWriter, Write},
+    mem,
     path::PathBuf,
     process::ExitCode,
     rc::Rc,
@@ -159,12 +161,7 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e)
-            if e.downcast_ref::<io::Error>().map(io::Error::kind)
-                == Some(io::ErrorKind::BrokenPipe) =>
-        {
-            ExitCode::SUCCESS
-        }
+        Err(e) if broken_pipe(&*e) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -172,12 +169,22 @@ fn main() -> ExitCode {
     }
 }
 
+fn broken_pipe(e: &(dyn Error + 'static)) -> bool {
+    let io = e
+        .downcast_ref::<io::Error>()
+        .or_else(|| match e.downcast_ref() {
+            Some(olean_export::Error::Io(io)) => Some(io),
+            _ => None,
+        });
+    io.is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+}
+
 /// Peak resident set so far, if the platform reports it.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn peak_rss() -> Option<u64> {
     // SAFETY: rusage is plain integers, for which zero is valid, and getrusage only writes it.
-    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    let mut u: libc::rusage = unsafe { mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut u) } != 0 {
         return None;
     }
@@ -265,7 +272,7 @@ fn inspect(cli: &Cli, target: &str, list: bool) -> Res {
             None => kinds.push((d.kind, 1)),
         }
     }
-    kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    kinds.sort_by_key(|k| Reverse(k.1));
     let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
     writeln!(
         out,
@@ -282,7 +289,7 @@ fn inspect(cli: &Cli, target: &str, list: bool) -> Res {
         }
     }
     let mut sections: Vec<_> = s.sections.iter().filter(|x| x.items > 0).collect();
-    sections.sort_by_key(|x| std::cmp::Reverse(x.bytes));
+    sections.sort_by_key(|x| Reverse(x.bytes));
     let total = s.bytes().max(1);
     let row = |out: &mut io::StdoutLock<'_>, bytes: u64, items: String, name: &str| {
         #[allow(clippy::cast_precision_loss)]
@@ -450,7 +457,7 @@ fn statement(
             thread::Builder::new()
                 .stack_size(1 << 30)
                 .spawn_scoped(s, || {
-                    olean_export::statement::report(&env, &search, &targets, trust, max, &mut out)
+                    statement::report(&env, &search, &targets, trust, max, &mut out)
                 })?
                 .join()
                 .expect("printer panicked")

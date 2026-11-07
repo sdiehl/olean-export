@@ -1,8 +1,11 @@
 use crate::{
     error::{at, Result},
-    olean::{is_scalar, Header, Image},
+    olean::{is_scalar, Header, Image, Safety},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    mem,
+    path::{Path, PathBuf},
+};
 
 const KINDS: [&str; 8] = [
     "axiom",
@@ -142,16 +145,10 @@ impl Summary {
 fn decl(img: &Image, info: u64) -> Result<Decl> {
     let tag = img.tag(info)?;
     let val = img.field(info, 0)?;
-    let flag = |k| Ok::<_, crate::Error>(img.scalar_u8(val, k)? != 0);
-    let safety = match tag {
-        1 => match img.scalar_u8(val, 0)? {
-            0 => "unsafe",
-            1 => "",
-            _ => "partial",
-        },
-        0 | 3 | 6 if flag(0)? => "unsafe",
-        5 | 7 if flag(1)? => "unsafe",
-        _ => "",
+    let safety = match img.safety(info)? {
+        Safety::Safe => "",
+        Safety::Unsafe => "unsafe",
+        Safety::Partial => "partial",
     };
     Ok(Decl {
         name: img.str_name(img.field(img.field(val, 0)?, 0)?)?,
@@ -166,7 +163,7 @@ fn reach(img: &Image, seen: &mut [bool], roots: &[u64]) -> Result<u64> {
     let mut bytes = 0;
     while let Some(o) = stack.pop() {
         let slot = img.slot(o)?;
-        if !std::mem::replace(&mut seen[slot], true) {
+        if !mem::replace(&mut seen[slot], true) {
             bytes += img.children(o, |c| stack.push(c))?;
         }
     }

@@ -222,9 +222,10 @@ pub struct IndRule {
     pub rhs: u32,
 }
 
-/// A destination for records.
+/// A destination for records. `id` is the id `r` defines, if it defines a name, level or
+/// expression; ids count from where the stream started, also across a resumed export.
 pub trait Sink {
     type Output;
-    fn record(&mut self, r: &Record<'_>) -> Result<()>;
+    fn record(&mut self, id: Option<u32>, r: &Record<'_>) -> Result<()>;
     fn finish(self) -> Result<Self::Output>;
 }

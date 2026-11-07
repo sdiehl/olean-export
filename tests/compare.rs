@@ -1,5 +1,5 @@
-use olean_export::{blean::Blean, compare, Env, Exporter, Sink};
-use std::path::PathBuf;
+use olean_export::{blean::Blean, compare, ndjson::Ndjson, Env, Exporter, Sink};
+use std::{fs, path::PathBuf, slice};
 
 fn cases() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases")
@@ -29,14 +29,14 @@ fn matches_lean4export() {
         ("Top", "Top-cone", &["Even.below.casesOn", "letty"]),
     ];
     for (module, file, consts) in runs {
-        let want = std::fs::read(cases().join(format!("lean4export/{file}.ndjson"))).unwrap();
-        let search = std::slice::from_ref(&build);
+        let want = fs::read(cases().join(format!("lean4export/{file}.ndjson"))).unwrap();
+        let search = slice::from_ref(&build);
         let env = if consts.is_empty() {
             Env::load(search, &[module]).unwrap()
         } else {
             Env::load_cone(search, &[module], consts, 1, &|_, _| {}).unwrap()
         };
-        let ndjson = export(&env, olean_export::ndjson::Ndjson::new(Vec::new()), consts);
+        let ndjson = export(&env, Ndjson::new(Vec::new()), consts);
         let blean = export(&env, Blean::new(Vec::new()), consts);
         for got in [ndjson, blean] {
             let d = compare(&want, &got).unwrap();
@@ -48,8 +48,8 @@ fn matches_lean4export() {
 #[test]
 fn reports_differences() {
     let dir = cases().join("lean4export");
-    let top = std::fs::read(dir.join("Top.ndjson")).unwrap();
-    let cone = std::fs::read(dir.join("Top-cone.ndjson")).unwrap();
+    let top = fs::read(dir.join("Top.ndjson")).unwrap();
+    let cone = fs::read(dir.join("Top-cone.ndjson")).unwrap();
     let d = compare(&top, &cone).unwrap();
     assert!(!d.only_a.is_empty() && d.only_b.is_empty() && d.differ.is_empty());
 }

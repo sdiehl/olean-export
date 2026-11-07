@@ -10,14 +10,13 @@ use crate::{
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 
 /// Writes records as NDJSON lines, byte for byte as lean4export does.
 #[derive(Debug)]
 pub struct Ndjson<W: Write> {
     out: W,
     buf: Vec<u8>,
-    next: Counts,
 }
 
 impl<W: Write> Ndjson<W> {
@@ -25,11 +24,6 @@ impl<W: Write> Ndjson<W> {
         Self {
             out,
             buf: Vec::new(),
-            next: Counts {
-                names: 1,
-                levels: 1,
-                exprs: 0,
-            },
         }
     }
 
@@ -76,10 +70,7 @@ impl<W: Write> Ndjson<W> {
                 '\\' => self.s("\\\\"),
                 '\n' => self.s("\\n"),
                 '\r' => self.s("\\r"),
-                '\t' => self.s("\\t"),
-                c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                    self.s("\\u00").s(&format!("{:02x}", c as u32))
-                }
+                c if (c as u32) < 0x20 => self.s("\\u00").s(&format!("{:02x}", c as u32)),
                 c => self.s(c.encode_utf8(&mut [0; 4])),
             };
         }
@@ -193,8 +184,8 @@ const fn binder(b: Binder) -> &'static str {
 impl<W: Write> Sink for Ndjson<W> {
     type Output = W;
 
-    fn record(&mut self, r: &Record<'_>) -> Result<()> {
-        let Some(id) = self.next.assign(r) else {
+    fn record(&mut self, id: Option<u32>, r: &Record<'_>) -> Result<()> {
+        let Some(id) = id else {
             self.start();
             match r {
                 Record::Meta(json) => {
@@ -485,19 +476,20 @@ pub fn read<S: Sink>(mut input: impl BufRead, mut sink: S) -> Result<S::Output> 
         rayon::in_place_scope(|s| {
             s.spawn(|_| ahead = parse(&lines, base + BATCH));
             fed = records.iter().try_for_each(|(n, id, r)| {
-                if let (Some(id), Some(want)) = (id, next.assign(r)) {
+                let want = next.assign(r);
+                if let (Some(id), Some(want)) = (id, want) {
                     if *id != want {
                         return Err(corrupt(format!("line {n}: id {id}, expected {want}")));
                     }
                 }
-                sink.record(r)
+                sink.record(want, r)
             });
         });
         fed?;
         parsed = ahead;
         base += BATCH;
     }
-    sink.record(&Record::End(next))?;
+    sink.record(None, &Record::End(next))?;
     sink.finish()
 }
 
@@ -505,7 +497,7 @@ fn batch(input: &mut impl BufRead, n: usize) -> Result<Vec<String>> {
     input
         .lines()
         .take(n)
-        .collect::<std::io::Result<_>>()
+        .collect::<io::Result<_>>()
         .map_err(Into::into)
 }
 

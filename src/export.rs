@@ -1,9 +1,9 @@
 use crate::{
     env::{
-        Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name,
-        NameId, Rec, Reload, Theorem, ANON, ZERO,
+        Binder, Builtins, Const, Ctor, Dep, Depth, Env, Expr, ExprId, Family, Inductive, Kind,
+        Level, LevelId, Name, NameId, Rec, Reload, ANON, ZERO,
     },
-    error::{corrupt, Result},
+    error::{corrupt, Error, Result},
     ndjson::Ndjson,
     record::{
         Binding, Counts, Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Safety, Sink,
@@ -57,10 +57,8 @@ pub struct Exporter<'a, S: Sink> {
     next: Counts,
     scanned: Vec<bool>,
     visited: FxHashSet<NameId>,
-    nat: Option<NameId>,
-    str_deps: [Option<NameId>; 2],
-    quot: [Option<NameId>; 5],
-    proofs: bool,
+    builtins: Builtins,
+    depth: Depth,
 }
 
 /// One step of [`Exporter::constant`]'s depth-first walk over dependencies.
@@ -69,31 +67,6 @@ enum Task {
     Scan(ExprId),
     Scanned(ExprId),
     Emit(NameId),
-}
-
-/// The constants of one mutual inductive block.
-struct Family<'e> {
-    types: Vec<(&'e Const, &'e Inductive)>,
-    ctors: Vec<(&'e Const, &'e Ctor)>,
-    recs: Vec<(&'e Const, &'e Rec)>,
-}
-
-impl<'e> Family<'e> {
-    fn consts(&self) -> impl DoubleEndedIterator<Item = &'e Const> + '_ {
-        let (t, c, r) = (&self.types, &self.ctors, &self.recs);
-        let ctors = c.iter().map(|&(k, _)| k);
-        let recs = r.iter().map(|&(k, _)| k);
-        t.iter().map(|&(k, _)| k).chain(ctors).chain(recs)
-    }
-
-    /// Every term of the block, in the order lean4export visits them.
-    fn terms(&self) -> impl DoubleEndedIterator<Item = ExprId> + '_ {
-        let rules = self
-            .recs
-            .iter()
-            .flat_map(|(_, r)| r.rules.iter().map(|rule| rule.rhs));
-        self.consts().map(|k| k.ty).chain(rules)
-    }
 }
 
 impl<'a, W: Write> Exporter<'a, Ndjson<W>> {
@@ -110,7 +83,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
     /// Continue the export `mark` was taken from, on the same environment.
     pub fn resume(env: &'a Env, sink: S, mark: Mark) -> Result<Self> {
         if mark.lineage != env.lineage {
-            return Err(corrupt("the mark is from another environment"));
+            return Err(Error::Misuse("the mark is from another environment"));
         }
         Ok(Self::from_mark(env, sink, mark))
     }
@@ -120,7 +93,6 @@ impl<'a, S: Sink> Exporter<'a, S> {
         m.levels.resize(env.levels.bound(), UNSEEN);
         m.exprs.resize(env.exprs.bound(), UNSEEN);
         m.scanned.resize(env.exprs.bound(), false);
-        let find = |s| env.find_name(s);
         Self {
             env,
             sink,
@@ -130,16 +102,8 @@ impl<'a, S: Sink> Exporter<'a, S> {
             next: m.next,
             scanned: m.scanned,
             visited: m.visited,
-            nat: find("Nat"),
-            str_deps: [find("Char.ofNat"), find("String.ofList")],
-            quot: [
-                find("Eq"),
-                find("Quot"),
-                find("Quot.mk"),
-                find("Quot.lift"),
-                find("Quot.ind"),
-            ],
-            proofs: true,
+            builtins: Builtins::find(env),
+            depth: Depth::Full,
         }
     }
 
@@ -148,19 +112,19 @@ impl<'a, S: Sink> Exporter<'a, S> {
     /// proofs.
     #[must_use]
     pub const fn statements(mut self) -> Self {
-        self.proofs = false;
+        self.depth = Depth::Statements;
         self
     }
 
     pub fn meta(&mut self) -> Result<()> {
         let h = &self.env.header;
-        let meta = format!(
-            r#"{{"exporter":{{"name":"olean-export","version":"{}"}},"format":{{"version":"3.1.0"}},"lean":{{"githash":"{}","version":"{}"}}}}"#,
-            env!("CARGO_PKG_VERSION"),
-            h.githash,
-            h.version
-        );
-        self.sink.record(&Record::Meta(meta.into()))
+        let meta = serde_json::json!({
+            "exporter": {"name": "olean-export", "version": env!("CARGO_PKG_VERSION")},
+            "format": {"version": "3.1.0"},
+            "lean": {"githash": h.githash, "version": h.version},
+        });
+        self.sink
+            .record(None, &Record::Meta(meta.to_string().into()))
     }
 
     /// Export every non-internal constant in load order, like `lean4export` with no `--`.
@@ -180,7 +144,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     /// Like [`Exporter::finish`], with a [`Mark`] to [`Exporter::resume`] from.
     pub fn suspend(mut self) -> Result<(S::Output, Mark)> {
-        self.sink.record(&Record::End(self.next))?;
+        self.sink.record(None, &Record::End(self.next))?;
         let mark = Mark {
             lineage: self.env.lineage,
             names: self.names,
@@ -195,15 +159,20 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     /// After [`Env::reload`], export the reloaded constants again as [`Exporter::all`] would.
     /// The end record counts every record since the first export.
+    /// An internal constant is written again if it was written before, since terms
+    /// already scanned will not lead back to it.
     pub fn update(&mut self, r: &Reload) -> Result<()> {
-        for c in r.consts.iter().chain(&r.removed) {
+        for c in &r.removed {
             self.visited.remove(c);
         }
         let env = self.env;
-        r.consts
+        let again: Vec<NameId> = r
+            .consts
             .iter()
-            .filter(|&&c| !env.is_internal(c))
-            .try_for_each(|&c| self.constant(c))
+            .copied()
+            .filter(|c| self.visited.remove(c) | !env.is_internal(*c))
+            .collect();
+        again.into_iter().try_for_each(|c| self.constant(c))
     }
 
     fn name(&mut self, n: NameId) -> Result<u32> {
@@ -291,14 +260,13 @@ impl<'a, S: Sink> Exporter<'a, S> {
                         self.name(*n)?;
                         work.extend([(*b, false), (*v, false), (*t, false)]);
                     }
-                    Expr::Nat(_) => {
-                        if let Some(nat) = self.nat {
-                            self.constant(nat)?;
-                        }
-                    }
-                    Expr::Str(_) => {
-                        for c in self.str_deps.into_iter().flatten() {
-                            self.constant(c)?;
+                    Expr::Nat(_) | Expr::Str(_) => {
+                        let mut lits = Vec::new();
+                        self.env.children(e, &self.builtins, |d| lits.push(d));
+                        for d in lits {
+                            if let Dep::Literal(c) = d {
+                                self.constant(c)?;
+                            }
                         }
                     }
                     Expr::Proj(n, _, x) => {
@@ -356,15 +324,13 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     /// Write a name, level or expression record and return its id.
     fn emit(&mut self, r: &Record<'_>) -> Result<u32> {
-        self.sink.record(r)?;
-        Ok(self
-            .next
-            .assign(r)
-            .expect("emit takes only id-bearing records"))
+        let id = self.next.assign(r);
+        self.sink.record(id, r)?;
+        Ok(id.expect("emit takes only id-bearing records"))
     }
 
     fn decl(&mut self, d: Decl) -> Result<()> {
-        self.sink.record(&Record::Decl(d))
+        self.sink.record(None, &Record::Decl(d))
     }
 
     /// Export a constant and, first, everything it mentions. Dependencies are walked
@@ -376,20 +342,15 @@ impl<'a, S: Sink> Exporter<'a, S> {
         while let Some(task) = work.pop() {
             match task {
                 Task::Scan(e) => {
-                    if self.scanned[e.index()] {
-                        continue;
-                    }
-                    work.push(Task::Scanned(e));
-                    match &env.exprs[e] {
-                        Expr::Const(n, _) => work.push(Task::Const(*n)),
-                        Expr::App(a, b) | Expr::Lam(_, a, b, _) | Expr::Pi(_, a, b, _) => {
-                            work.extend([Task::Scan(*b), Task::Scan(*a)]);
-                        }
-                        Expr::Let(_, t, v, b) => {
-                            work.extend([Task::Scan(*b), Task::Scan(*v), Task::Scan(*t)]);
-                        }
-                        Expr::Proj(_, _, x) => work.push(Task::Scan(*x)),
-                        Expr::BVar(_) | Expr::Sort(_) | Expr::Nat(_) | Expr::Str(_) => {}
+                    if !self.scanned[e.index()] {
+                        work.push(Task::Scanned(e));
+                        let at = work.len();
+                        env.children(e, &self.builtins, |d| match d {
+                            Dep::Expr(x) => work.push(Task::Scan(x)),
+                            Dep::Const(c) => work.push(Task::Const(c)),
+                            Dep::Member(_) | Dep::Literal(_) | Dep::Unloaded(_) => {}
+                        });
+                        work[at..].reverse();
                     }
                 }
                 Task::Scanned(e) => self.scanned[e.index()] = true,
@@ -400,39 +361,27 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     let Some(k) = env.consts.get(&c) else {
                         continue;
                     };
-                    match &k.kind {
-                        Kind::Axiom => work.extend([Task::Emit(c), Task::Scan(k.ty)]),
-                        Kind::Thm(_) if !self.proofs => {
-                            work.extend([Task::Emit(c), Task::Scan(k.ty)]);
-                        }
-                        Kind::Defn(Defn { value, .. })
-                        | Kind::Thm(Theorem {
-                            value: Some(value), ..
-                        })
-                        | Kind::Opaque(Body { value, .. }) => {
-                            work.extend([Task::Emit(c), Task::Scan(*value), Task::Scan(k.ty)]);
-                        }
-                        Kind::Thm(_) => {
-                            return Err(corrupt(format!(
-                                "the value of {} was not loaded",
-                                env.display(c)
-                            )))
-                        }
-                        Kind::Quot(_) => {
-                            work.push(Task::Emit(c));
-                            work.extend(self.quot[0].map(Task::Const));
-                        }
-                        Kind::Induct(ind) => {
-                            let fam = self.family(k, ind)?;
-                            self.visited.extend(fam.consts().map(|k| k.name));
-                            work.push(Task::Emit(c));
-                            work.extend(fam.terms().rev().map(Task::Scan));
-                        }
-                        Kind::Ctor(ctor) => work.push(Task::Const(ctor.induct)),
-                        Kind::Rec(rec) => {
-                            work.extend(rec.all.iter().rev().map(|&i| Task::Const(i)));
-                        }
+                    if !matches!(k.kind, Kind::Ctor(_) | Kind::Rec(_)) {
+                        work.push(Task::Emit(c));
                     }
+                    let at = work.len();
+                    let mut unloaded = None;
+                    env.mentions(k, self.depth, &self.builtins, |d| match d {
+                        Dep::Expr(e) => work.push(Task::Scan(e)),
+                        Dep::Const(c) => work.push(Task::Const(c)),
+                        Dep::Member(c) => {
+                            self.visited.insert(c);
+                        }
+                        Dep::Literal(_) => {}
+                        Dep::Unloaded(c) => unloaded = Some(c),
+                    })?;
+                    if let Some(c) = unloaded {
+                        return Err(corrupt(format!(
+                            "the value of {} was not loaded",
+                            env.display(c)
+                        )));
+                    }
+                    work[at..].reverse();
                 }
                 Task::Emit(c) => self.write(c)?,
             }
@@ -444,7 +393,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
     fn write(&mut self, c: NameId) -> Result<()> {
         let k = &self.env.consts[&c];
         match &k.kind {
-            Kind::Thm(_) if !self.proofs => {
+            Kind::Thm(_) if self.depth == Depth::Statements => {
                 let head = self.header(k)?;
                 self.decl(Decl::Axiom {
                     head,
@@ -505,10 +454,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
 
     fn quot(&mut self) -> Result<()> {
         let env = self.env;
-        let [_, rest @ ..] = self.quot;
+        let [_, rest @ ..] = self.builtins.quot;
         for c in rest.into_iter().flatten() {
-            self.visited.insert(c);
-            let (k, &kind) = lookup(env, c, "quotient", |k| match k {
+            let (k, &kind) = env.lookup(c, "quotient", |k| match k {
                 Kind::Quot(q) => Some(q),
                 _ => None,
             })?;
@@ -518,46 +466,8 @@ impl<'a, S: Sink> Exporter<'a, S> {
         Ok(())
     }
 
-    /// The mutual block of `base`: its types, their constructors and their recursors.
-    fn family(&self, base: &Const, ind: &Inductive) -> Result<Family<'a>> {
-        let env = self.env;
-        let types = ind
-            .all
-            .iter()
-            .map(|&n| {
-                lookup(env, n, "inductive", |k| match k {
-                    Kind::Induct(i) => Some(i),
-                    _ => None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ctors = types
-            .iter()
-            .flat_map(|(_, i)| &i.ctors)
-            .map(|&c| {
-                lookup(env, c, "constructor", |k| match k {
-                    Kind::Ctor(c) => Some(c),
-                    _ => None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let recs = env
-            .recursors
-            .get(&base.name)
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .map(|&r| {
-                lookup(env, r, "recursor", |k| match k {
-                    Kind::Rec(r) => Some(r),
-                    _ => None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Family { types, ctors, recs })
-    }
-
     fn inductive(&mut self, base: &Const, ind: &Inductive) -> Result<()> {
-        let Family { types, ctors, recs } = self.family(base, ind)?;
+        let Family { types, ctors, recs } = self.env.family(base, ind)?;
         let mut out_ctors = Vec::with_capacity(ctors.len());
         for &(c, ctor) in &ctors {
             let Ctor {
@@ -642,18 +552,4 @@ impl<'a, S: Sink> Exporter<'a, S> {
             recs: out_recs,
         })
     }
-}
-
-/// The constant `n` and the part of its kind that `pick` selects, or an error saying it is
-/// not the `what` the referring constant claims.
-fn lookup<'e, T>(
-    env: &'e Env,
-    n: NameId,
-    what: &str,
-    pick: impl Fn(&'e Kind) -> Option<&'e T>,
-) -> Result<(&'e Const, &'e T)> {
-    env.consts
-        .get(&n)
-        .and_then(|c| Some((c, pick(&c.kind)?)))
-        .ok_or_else(|| corrupt(format!("{} is not a known {what}", env.display(n))))
 }

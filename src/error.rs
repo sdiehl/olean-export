@@ -25,6 +25,9 @@ pub enum Error {
         hi = SUPPORTED.end()
     )]
     UnsupportedLean(String),
+    /// The library was called in a way it does not support.
+    #[error("{0}")]
+    Misuse(&'static str),
     /// The file is malformed, or the environment it describes is inconsistent.
     #[error("{0}")]
     Corrupt(String),

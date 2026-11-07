@@ -6,13 +6,15 @@
 //! by `==` in time linear in its DAG, never its tree.
 
 use crate::{
-    error::Result,
+    blean,
+    error::{corrupt, Result},
+    ndjson,
     record::{Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Sink, Table},
 };
 use hashbrown::{hash_table::Entry, HashTable};
 use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::hash::BuildHasher;
+use std::{cell::Cell, hash::BuildHasher, mem, thread};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
@@ -34,7 +36,6 @@ enum Key {
     Nat(Box<str>),
     Str(Box<str>),
     Proj(u32, u64, u32),
-    MData(u32),
 }
 
 const SHARDS: usize = 256;
@@ -104,6 +105,8 @@ struct Side<'c> {
     decls: FxHashMap<u32, Decl>,
     dups: Vec<u32>,
     count: usize,
+    /// The first reference to an id not yet defined, if any.
+    dangling: Cell<Option<u32>>,
 }
 
 impl<'c> Side<'c> {
@@ -118,11 +121,19 @@ impl<'c> Side<'c> {
             decls: FxHashMap::default(),
             dups: Vec::new(),
             count: 0,
+            dangling: Cell::new(None),
         }
     }
 
+    fn id(&self, table: &[u32], i: u32) -> u32 {
+        table.get(i as usize).copied().unwrap_or_else(|| {
+            self.dangling.set(self.dangling.get().or(Some(i)));
+            0
+        })
+    }
+
     fn n(&self, i: u32) -> u32 {
-        self.names[i as usize]
+        self.id(&self.names, i)
     }
 
     fn ns(&self, is: &[u32]) -> Vec<u32> {
@@ -130,11 +141,11 @@ impl<'c> Side<'c> {
     }
 
     fn l(&self, i: u32) -> u32 {
-        self.levels[i as usize]
+        self.id(&self.levels, i)
     }
 
     fn e(&self, i: u32) -> u32 {
-        self.exprs[i as usize]
+        self.id(&self.exprs, i)
     }
 
     fn head(&self, h: &Head) -> Head {
@@ -233,10 +244,18 @@ impl<'c> Side<'c> {
     }
 }
 
+impl Side<'_> {
+    fn check(&self) -> Result<()> {
+        self.dangling.get().map_or(Ok(()), |i| {
+            Err(corrupt(format!("reference to undefined id {i}")))
+        })
+    }
+}
+
 impl Sink for &mut Side<'_> {
     type Output = ();
 
-    fn record(&mut self, r: &Record<'_>) -> Result<()> {
+    fn record(&mut self, _: Option<u32>, r: &Record<'_>) -> Result<()> {
         let key = match r {
             Record::Meta(_) | Record::End(_) => return Ok(()),
             Record::Decl(d) => {
@@ -246,7 +265,7 @@ impl Sink for &mut Side<'_> {
                 if self.decls.insert(k, d).is_some() {
                     self.dups.push(k);
                 }
-                return Ok(());
+                return self.check();
             }
             Record::NameStr { pre, str } => Key::NameStr(self.n(*pre), (**str).into()),
             Record::NameNum { pre, i } => Key::NameNum(self.n(*pre), *i),
@@ -276,7 +295,12 @@ impl Sink for &mut Side<'_> {
                 idx,
                 struct_,
             } => Key::Proj(self.n(*type_name), *idx, self.e(*struct_)),
-            Record::MData(e) => Key::MData(self.e(*e)),
+            // lean4export's kernels read mdata as the term it wraps, and so does the exporter
+            Record::MData(e) => {
+                let id = self.e(*e);
+                self.exprs.push(id);
+                return self.check();
+            }
         };
         let table = r.table();
         let id = self.canon.intern(key);
@@ -285,7 +309,7 @@ impl Sink for &mut Side<'_> {
             Some(Table::Levels) => self.levels.push(id),
             _ => self.exprs.push(id),
         }
-        Ok(())
+        self.check()
     }
 
     fn finish(self) -> Result<()> {
@@ -313,7 +337,7 @@ fn what(a: &Decl, b: &Decl) -> &'static str {
         | Decl::Opaque { head, value, .. } => Some((head.clone(), Some(*value))),
         Decl::Inductive { .. } => None,
     };
-    if std::mem::discriminant(a) != std::mem::discriminant(b) {
+    if mem::discriminant(a) != mem::discriminant(b) {
         return "kind";
     }
     match (parts(a), parts(b)) {
@@ -349,10 +373,10 @@ impl Diff {
 /// Compare two exports, each NDJSON or blean.
 pub fn compare(a: &[u8], b: &[u8]) -> Result<Diff> {
     fn load(bytes: &[u8], side: &mut Side<'_>) -> Result<()> {
-        if crate::blean::sniff(bytes) {
-            crate::blean::read(bytes, side)
+        if blean::sniff(bytes) {
+            blean::read(bytes, side)
         } else {
-            crate::ndjson::read(bytes, side)
+            ndjson::read(bytes, side)
         }
     }
     let canon = Canon::new();
@@ -360,7 +384,7 @@ pub fn compare(a: &[u8], b: &[u8]) -> Result<Diff> {
         let mut s = Side::new(&canon);
         load(bytes, &mut s).map(|()| (s.decls, s.count, s.dups))
     };
-    let (ra, rb) = std::thread::scope(|t| {
+    let (ra, rb) = thread::scope(|t| {
         let a = t.spawn(|| side(a));
         let b = side(b);
         (a.join().expect("compare thread panicked"), b)

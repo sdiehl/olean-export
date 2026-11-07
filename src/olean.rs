@@ -1,6 +1,23 @@
 use crate::error::{at, corrupt, Error, Result};
 use memmap2::{Mmap, MmapOptions};
-use std::{fmt::Write as _, fs::File, path::Path};
+use std::{fmt::Write as _, fs::File, ops::RangeInclusive, path::Path, str};
+
+// `ConstantInfo` constructor tags.
+pub(crate) const AXIOM: u8 = 0;
+pub(crate) const DEFN: u8 = 1;
+pub(crate) const THM: u8 = 2;
+pub(crate) const OPAQUE: u8 = 3;
+pub(crate) const QUOT: u8 = 4;
+pub(crate) const INDUCT: u8 = 5;
+pub(crate) const CTOR: u8 = 6;
+pub(crate) const REC: u8 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Safety {
+    Safe,
+    Unsafe,
+    Partial,
+}
 
 const ARRAY: u8 = 246;
 const SCALAR_ARRAY: u8 = 248;
@@ -35,7 +52,7 @@ pub(crate) struct Image {
 }
 
 /// The Lean releases whose object layouts this reader has been checked against.
-pub const SUPPORTED: std::ops::RangeInclusive<u32> = 26..=35;
+pub const SUPPORTED: RangeInclusive<u32> = 26..=35;
 
 fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b.split(|&c| c == 0).next().unwrap_or_default()).into_owned()
@@ -87,9 +104,16 @@ impl Image {
         if !minor.is_some_and(|m| SUPPORTED.contains(&m)) {
             return Err(Error::UnsupportedLean(version));
         }
+        let githash = cstr(&bytes[40..80]);
+        if !self.parts.is_empty() && githash != self.header.githash {
+            return Err(corrupt(format!(
+                "built by Lean {githash}, but its .olean by {}",
+                self.header.githash
+            )));
+        }
         self.header = Header {
             version,
-            githash: cstr(&bytes[40..80]),
+            githash,
             gmp: bytes[6] & 1 == 1,
         };
         let base = le64(&bytes[80..88]);
@@ -146,6 +170,23 @@ impl Image {
         self.u8(o + 8 + 8 * num_objs + k)
     }
 
+    /// How the `ConstantInfo` at `info` was declared, from the flags its kind keeps in the
+    /// scalar area of its value.
+    pub(crate) fn safety(&self, info: u64) -> Result<Safety> {
+        let val = self.field(info, 0)?;
+        let flag = |k| Ok::<_, Error>(self.scalar_u8(val, k)? != 0);
+        Ok(match self.tag(info)? {
+            DEFN => match self.scalar_u8(val, 0)? {
+                0 => Safety::Unsafe,
+                1 => Safety::Safe,
+                _ => Safety::Partial,
+            },
+            AXIOM | OPAQUE | CTOR if flag(0)? => Safety::Unsafe,
+            INDUCT | REC if flag(1)? => Safety::Unsafe,
+            _ => Safety::Safe,
+        })
+    }
+
     pub(crate) fn scalar_u32(&self, o: u64) -> Result<u32> {
         let b = self.bytes(o + 8 + 8 * u64::from(self.u8(o + 6)?), 4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -166,9 +207,8 @@ impl Image {
         let cs_sz = u64::from(u16::from_le_bytes([b[0], b[1]]));
         let size = match self.tag(o)? {
             ARRAY => {
-                let n = self.u64(o + 16)?;
-                each(o + 24, n)?;
-                24 + 8 * n
+                each(o + 24, self.u64(o + 8)?)?;
+                24 + 8 * self.u64(o + 16)?
             }
             SCALAR_ARRAY => 24 + u64::from(self.u8(o + 6)?) * self.u64(o + 16)?,
             STRING => 32 + self.u64(o + 16)?,
@@ -201,7 +241,7 @@ impl Image {
         self.expect(o, STRING, "a string")?;
         let size = usize::try_from(self.u64(o + 8)?).map_err(corrupt)?;
         let bytes = self.bytes(o + 32, size.saturating_sub(1))?;
-        std::str::from_utf8(bytes).map_err(corrupt)
+        str::from_utf8(bytes).map_err(corrupt)
     }
 
     pub(crate) fn array(&self, o: u64) -> Result<Vec<u64>> {

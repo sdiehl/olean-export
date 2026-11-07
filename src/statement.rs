@@ -9,7 +9,13 @@ use crate::{
     olean::{small_nat, Image},
 };
 use rustc_hash::FxHashMap;
-use std::{fmt::Write as _, io::Write, path::PathBuf};
+use std::{
+    collections::hash_map::Entry,
+    fmt::Write as _,
+    io::Write,
+    mem,
+    path::{Path, PathBuf},
+};
 
 /// Print the statements of `roots` and what they rest on, outside the modules `trust` names.
 ///
@@ -24,7 +30,7 @@ pub fn report(
     max: usize,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let cone = env.statement(roots);
+    let cone = env.statement(roots)?;
     let trusted = |m: usize| {
         let m = &env.modules[m];
         trust.iter().any(|t| {
@@ -75,7 +81,7 @@ pub fn report(
     let roots = roots.iter().map(|&c| (module_of(c), c));
     for (m, c) in roots.chain(shown) {
         let module = &env.modules[m];
-        if let std::collections::hash_map::Entry::Vacant(e) = lines.entry(m) {
+        if let Entry::Vacant(e) = lines.entry(m) {
             e.insert(ranges(&resolve(search, module)?)?);
         }
         let file = format!("{}.lean", module.replace('.', "/"));
@@ -90,7 +96,7 @@ pub fn report(
 }
 
 /// The first and last source line of each declaration of a module, from `declRangeExt`.
-fn ranges(path: &std::path::Path) -> Result<FxHashMap<String, (u64, u64)>> {
+fn ranges(path: &Path) -> Result<FxHashMap<String, (u64, u64)>> {
     let img = Image::open_module(path)?;
     let mut out = FxHashMap::default();
     for e in img.array(img.field(img.root, 4)?)? {
@@ -176,7 +182,7 @@ impl<'e> Printer<'e> {
     fn term(&mut self, e: ExprId) -> String {
         self.out.clear();
         self.expr(e, TOP);
-        let mut s = std::mem::take(&mut self.out);
+        let mut s = mem::take(&mut self.out);
         if self.max > 0 && s.len() > self.max {
             let mut cut = self.max;
             while !s.is_char_boundary(cut) {
