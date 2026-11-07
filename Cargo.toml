@@ -39,6 +39,9 @@ serde_json = { version = "1.0.151", features = ["raw_value"] }
 thiserror = "2"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 mimalloc = ["dep:mimalloc"]
 

@@ -1,7 +1,7 @@
 use crate::{
     env::{
         Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Inductive, Kind, Level, LevelId, Name,
-        NameId, Rec, Reload, ANON, ZERO,
+        NameId, Rec, Reload, Theorem, ANON, ZERO,
     },
     error::{corrupt, Result},
     ndjson::Ndjson,
@@ -392,9 +392,17 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     match &k.kind {
                         Kind::Axiom => work.extend([Task::Emit(c), Task::Scan(k.ty)]),
                         Kind::Defn(Defn { value, .. })
-                        | Kind::Thm(Body { value, .. })
+                        | Kind::Thm(Theorem {
+                            value: Some(value), ..
+                        })
                         | Kind::Opaque(Body { value, .. }) => {
                             work.extend([Task::Emit(c), Task::Scan(*value), Task::Scan(k.ty)]);
+                        }
+                        Kind::Thm(_) => {
+                            return Err(corrupt(format!(
+                                "the value of {} was not loaded",
+                                env.display(c)
+                            )))
                         }
                         Kind::Quot(_) => {
                             work.push(Task::Emit(c));
@@ -442,19 +450,21 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     safety: Safety::Safe,
                 })
             }
-            Kind::Thm(b) | Kind::Opaque(b) => {
+            Kind::Thm(t) => {
+                let head = self.header(k)?;
+                let value = self.expr(t.value.expect("scanned"))?;
+                let all = self.name_list(&t.all)?;
+                self.decl(Decl::Thm { head, value, all })
+            }
+            Kind::Opaque(b) => {
                 let head = self.header(k)?;
                 let value = self.expr(b.value)?;
                 let all = self.name_list(&b.all)?;
-                self.decl(if matches!(k.kind, Kind::Thm(_)) {
-                    Decl::Thm { head, value, all }
-                } else {
-                    Decl::Opaque {
-                        head,
-                        value,
-                        is_unsafe: false,
-                        all: Some(all),
-                    }
+                self.decl(Decl::Opaque {
+                    head,
+                    value,
+                    is_unsafe: false,
+                    all: Some(all),
                 })
             }
             Kind::Quot(_) => self.quot(),

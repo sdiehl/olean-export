@@ -13,6 +13,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("module {0} not found on LEAN_PATH")]
     ModuleNotFound(String),
+    #[error("unknown constant {0}")]
+    UnknownConstant(String),
     #[error("not an olean file")]
     NotOlean,
     #[error("unsupported olean format {0}")]

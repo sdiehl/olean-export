@@ -94,9 +94,9 @@ fn main() {
                 "{name} : {ty}\n  := {}\n",
                 expr(&env, d.value, &mut Vec::new())
             ),
-            Kind::Thm(b) => println!(
+            Kind::Thm(t) => println!(
                 "{name} : {ty}\n  := {}\n",
-                expr(&env, b.value, &mut Vec::new())
+                expr(&env, t.value.unwrap(), &mut Vec::new())
             ),
             Kind::Induct(ind) => {
                 let cs: Vec<String> = ind.ctors.iter().map(|&c| env.display(c)).collect();

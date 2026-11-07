@@ -11,6 +11,7 @@
 )]
 
 pub mod blean;
+pub mod compare;
 mod env;
 mod error;
 mod export;
@@ -20,9 +21,11 @@ pub mod ndjson;
 mod olean;
 pub mod record;
 
+pub use compare::{compare, Diff};
 pub use env::{
     resolve, search_path, Binder, Body, Const, Ctor, Defn, Env, Expr, ExprId, Exprs, Hints, Id,
-    Inductive, Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Reload, Rule, Table, ANON, ZERO,
+    Inductive, Kind, Level, LevelId, Name, NameId, QuotKind, Rec, Reload, Rule, Table, Theorem,
+    ANON, ZERO,
 };
 pub use error::{Error, Result};
 pub use export::{Exporter, Mark};

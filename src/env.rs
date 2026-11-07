@@ -190,10 +190,17 @@ pub struct Defn {
     pub all: Vec<NameId>,
 }
 
-/// The value of a theorem or opaque constant.
+/// The value of an opaque constant.
 #[derive(Debug)]
 pub struct Body {
     pub value: ExprId,
+    pub all: Vec<NameId>,
+}
+
+/// A theorem. Its value is `None` when [`Env::load_cone`] did not need it.
+#[derive(Debug)]
+pub struct Theorem {
+    pub value: Option<ExprId>,
     pub all: Vec<NameId>,
 }
 
@@ -231,7 +238,7 @@ pub struct Rec {
 pub enum Kind {
     Axiom,
     Defn(Defn),
-    Thm(Body),
+    Thm(Theorem),
     Opaque(Body),
     Quot(QuotKind),
     Induct(Inductive),
@@ -532,6 +539,8 @@ struct Module {
     recursors: FxHashMap<NameId, Vec<NameId>>,
     skipped: usize,
     header: Header,
+    /// Theorems whose values were left in the olean, with the values' addresses.
+    pending: Vec<(NameId, u64)>,
 }
 
 /// The olean parts of a module that exist, with their sizes and modification times.
@@ -551,11 +560,13 @@ fn stamp(path: &Path) -> Stamp {
 #[derive(Debug)]
 struct Loaded {
     module: String,
+    path: PathBuf,
     stamp: Stamp,
     consts: Vec<NameId>,
     recursors: FxHashMap<NameId, Vec<NameId>>,
     skipped: usize,
     header: Header,
+    pending: Vec<(NameId, u64)>,
 }
 
 /// What an env from [`Env::open`] keeps to decode more modules into its tables.
@@ -623,13 +634,180 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<Self> {
-        Self::build(search, roots, jobs, progress, false)
+        Self::build(search, roots, jobs, progress, false, false)
+    }
+
+    /// Like [`Env::load_with`], but decode only the theorem values that exporting `consts`
+    /// reaches. The rest stay in their oleans, as `None`.
+    pub fn load_cone(
+        search: &[PathBuf],
+        roots: &[&str],
+        consts: &[&str],
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        let mut env = Self::build(search, roots, jobs, progress, true, true)?;
+        let mut live = env.live.take().expect("built live");
+        let mut todo = consts
+            .iter()
+            .map(|c| {
+                env.find_name(c)
+                    .map(Item::Const)
+                    .ok_or_else(|| Error::UnknownConstant((*c).to_owned()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let pending: FxHashMap<NameId, (usize, u64)> = live
+            .loaded
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| l.pending.iter().map(move |&(n, o)| (n, (i, o))))
+            .collect();
+        let mut walk = Walk::default();
+        loop {
+            let mut due: Vec<_> = env
+                .walk(&mut walk, todo)
+                .into_iter()
+                .map(|n| (pending[&n], n))
+                .collect();
+            if due.is_empty() {
+                return Ok(env);
+            }
+            due.sort_unstable_by_key(|&(p, _)| p);
+            todo = Vec::new();
+            for (n, v) in env.decode_values(&mut live, &due)? {
+                if let Some(Const {
+                    kind: Kind::Thm(t), ..
+                }) = env.consts.get_mut(&n)
+                {
+                    t.value = Some(v);
+                }
+                todo.push(Item::Expr(v));
+            }
+        }
+    }
+
+    /// Continue `w` from `todo` over everything an export of it would visit, returning the
+    /// theorems reached whose values are not decoded.
+    fn walk(&self, w: &mut Walk, mut todo: Vec<Item>) -> Vec<NameId> {
+        w.exprs.resize(self.exprs.bound(), false);
+        let consts = |names: &[&str]| -> Vec<Item> {
+            names
+                .iter()
+                .filter_map(|n| self.find_name(n).map(Item::Const))
+                .collect()
+        };
+        let (nat, strs) = (consts(&["Nat"]), consts(&["Char.ofNat", "String.ofList"]));
+        let quot = consts(&["Eq", "Quot", "Quot.mk", "Quot.lift", "Quot.ind"]);
+        let mut out = Vec::new();
+        while let Some(item) = todo.pop() {
+            match item {
+                Item::Expr(e) => {
+                    if std::mem::replace(&mut w.exprs[e.index()], true) {
+                        continue;
+                    }
+                    match &self.exprs[e] {
+                        Expr::Const(n, _) => todo.push(Item::Const(*n)),
+                        Expr::App(a, b) | Expr::Lam(_, a, b, _) | Expr::Pi(_, a, b, _) => {
+                            todo.extend([Item::Expr(*a), Item::Expr(*b)]);
+                        }
+                        Expr::Let(_, t, v, b) => {
+                            todo.extend([Item::Expr(*t), Item::Expr(*v), Item::Expr(*b)]);
+                        }
+                        Expr::Proj(_, _, x) => todo.push(Item::Expr(*x)),
+                        Expr::Nat(_) => todo.extend(nat.iter().copied()),
+                        Expr::Str(_) => todo.extend(strs.iter().copied()),
+                        Expr::BVar(_) | Expr::Sort(_) => {}
+                    }
+                }
+                Item::Const(c) => {
+                    if !w.consts.insert(c) {
+                        continue;
+                    }
+                    let Some(k) = self.consts.get(&c) else {
+                        continue;
+                    };
+                    todo.push(Item::Expr(k.ty));
+                    let names =
+                        |ns: &[NameId]| ns.iter().map(|&n| Item::Const(n)).collect::<Vec<_>>();
+                    match &k.kind {
+                        Kind::Axiom => {}
+                        Kind::Defn(Defn { value, .. }) | Kind::Opaque(Body { value, .. }) => {
+                            todo.push(Item::Expr(*value));
+                        }
+                        Kind::Thm(t) => match t.value {
+                            Some(v) => todo.push(Item::Expr(v)),
+                            None => out.push(c),
+                        },
+                        Kind::Quot(_) => todo.extend(quot.iter().copied()),
+                        Kind::Induct(i) => {
+                            todo.extend(names(&i.all));
+                            todo.extend(names(&i.ctors));
+                            todo.extend(names(self.recursors.get(&c).map_or(&[], Vec::as_slice)));
+                        }
+                        Kind::Ctor(x) => todo.push(Item::Const(x.induct)),
+                        Kind::Rec(r) => {
+                            todo.extend(names(&r.all));
+                            todo.extend(r.rules.iter().map(|u| Item::Expr(u.rhs)));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode the theorem values `due`, sorted by module, into the tables.
+    fn decode_values(
+        &mut self,
+        live: &mut Live,
+        due: &[((usize, u64), NameId)],
+    ) -> Result<Vec<(NameId, ExprId)>> {
+        let tables = Tables {
+            names: std::mem::replace(&mut self.names, Table(Vec::new())).thaw(),
+            levels: std::mem::replace(&mut self.levels, Table(Vec::new())).thaw(),
+            exprs: SharedExprs::thaw(
+                std::mem::replace(&mut self.exprs, Exprs(Vec::new())),
+                std::mem::take(&mut live.index),
+                std::mem::take(&mut live.ranks),
+            ),
+        };
+        let groups: Vec<_> = due.chunk_by(|a, b| a.0 .0 == b.0 .0).collect();
+        let loaded = &live.loaded;
+        let decoded = rayon::ThreadPoolBuilder::new()
+            .num_threads(live.jobs.max(1))
+            .build()
+            .map_err(Error::from)
+            .and_then(|pool| {
+                pool.install(|| {
+                    groups
+                        .par_iter()
+                        .map_init(
+                            || None,
+                            |cursor, group| {
+                                let path = &loaded[group[0].0 .0].path;
+                                let img = Image::open_module(path)?;
+                                let rank = u32::try_from(group[0].0 .0).expect("module count");
+                                let mut dec = Decoder::new(&img, &tables, rank, cursor, false);
+                                group
+                                    .iter()
+                                    .map(|&((_, o), n)| Ok((n, dec.expr(o)?)))
+                                    .collect::<Result<Vec<_>>>()
+                                    .map_err(at(path))
+                            },
+                        )
+                        .collect::<Result<Vec<_>>>()
+                })
+            });
+        self.names = tables.names.freeze();
+        self.levels = tables.levels.freeze();
+        (self.exprs, live.index, live.ranks) = tables.exprs.freeze();
+        Ok(decoded?.into_iter().flatten().collect())
     }
 
     /// Like [`Env::load_with`], but keeps the expression index so that [`Env::reload`] can
     /// decode changed modules into the same tables. That costs about 10 bytes per expression.
     pub fn open(search: &[PathBuf], roots: &[&str], jobs: usize) -> Result<Self> {
-        Self::build(search, roots, jobs, &|_, _| {}, true)
+        Self::build(search, roots, jobs, &|_, _| {}, true, false)
     }
 
     fn build(
@@ -638,6 +816,7 @@ impl Env {
         jobs: usize,
         progress: &(dyn Fn(usize, usize) + Sync),
         live: bool,
+        lazy: bool,
     ) -> Result<Self> {
         let found = discover_all(search, roots)?;
         let stamps: Vec<Stamp> = found.iter().map(|(_, p)| stamp(p)).collect();
@@ -651,7 +830,7 @@ impl Env {
             exprs: SharedExprs::new(estimate(64)),
         };
         let paths: Vec<_> = found.iter().map(|(_, p)| p.as_path()).enumerate().collect();
-        let decoded = decode_all(&tables, &paths, jobs, progress);
+        let decoded = decode_all(&tables, &paths, jobs, progress, lazy);
         let (exprs, index, ranks) = tables.exprs.freeze();
         let kept = live.then_some((index, ranks));
         let decoded = decoded?;
@@ -672,7 +851,7 @@ impl Env {
             .into_iter()
             .zip(stamps)
             .zip(decoded)
-            .map(|(((module, _), stamp), m)| env.add(module, stamp, m))
+            .map(|(((module, path), stamp), m)| env.add(module, path, stamp, m))
             .collect();
         env.index(&loaded);
         if let Some((index, ranks)) = kept {
@@ -688,17 +867,19 @@ impl Env {
         Ok(env)
     }
 
-    fn add(&mut self, module: String, stamp: Stamp, m: Module) -> Loaded {
+    fn add(&mut self, module: String, path: PathBuf, stamp: Stamp, m: Module) -> Loaded {
         let consts = m.consts.iter().map(|c| c.name).collect();
         self.consts
             .extend(m.consts.into_iter().map(|c| (c.name, c)));
         Loaded {
             module,
+            path,
             stamp,
             consts,
             recursors: m.recursors,
             skipped: m.skipped,
             header: m.header,
+            pending: m.pending,
         }
     }
 
@@ -766,7 +947,7 @@ impl Env {
                 std::mem::take(&mut live.ranks),
             ),
         };
-        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {});
+        let decoded = decode_all(&tables, &fresh, live.jobs, &|_, _| {}, false);
         self.names = tables.names.freeze();
         self.levels = tables.levels.freeze();
         (self.exprs, live.index, live.ranks) = tables.exprs.freeze();
@@ -794,11 +975,11 @@ impl Env {
             .into_iter()
             .zip(stamps)
             .enumerate()
-            .map(|(i, ((module, _), stamp))| match decoded.remove(&i) {
+            .map(|(i, ((module, path), stamp))| match decoded.remove(&i) {
                 Some(m) => {
                     reload.modules.push(module.clone());
                     reload.consts.extend(m.consts.iter().map(|c| c.name));
-                    self.add(module, stamp, m)
+                    self.add(module, path, stamp, m)
                 }
                 None => prev.remove(&module).expect("unchanged module was loaded"),
             })
@@ -848,21 +1029,15 @@ impl Env {
     }
 }
 
-fn decode(tables: &Tables, rank: u32, cursor: &mut Option<usize>, path: &Path) -> Result<Module> {
+fn decode(
+    tables: &Tables,
+    rank: u32,
+    cursor: &mut Option<usize>,
+    path: &Path,
+    lazy: bool,
+) -> Result<Module> {
     let img = Image::open_module(path)?;
-    let mut dec = Decoder {
-        img: &img,
-        tables,
-        rank,
-        cursor,
-        memo: vec![0; img.slots()],
-        module: Module {
-            consts: Vec::new(),
-            recursors: FxHashMap::default(),
-            skipped: 0,
-            header: img.header.clone(),
-        },
-    };
+    let mut dec = Decoder::new(&img, tables, rank, cursor, lazy);
     dec.run().map_err(at(path))?;
     Ok(dec.module)
 }
@@ -873,6 +1048,7 @@ fn decode_all(
     paths: &[(usize, &Path)],
     jobs: usize,
     progress: &(dyn Fn(usize, usize) + Sync),
+    lazy: bool,
 ) -> Result<Vec<Module>> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs.max(1))
@@ -885,7 +1061,7 @@ fn decode_all(
                 || None,
                 |cursor, &(rank, path)| {
                     let rank = u32::try_from(rank).expect("module count");
-                    let m = decode(tables, rank, cursor, path)?;
+                    let m = decode(tables, rank, cursor, path, lazy)?;
                     let n = consts.fetch_add(m.consts.len(), Relaxed) + m.consts.len();
                     progress(done.fetch_add(1, Relaxed) + 1, n);
                     Ok(m)
@@ -973,12 +1149,52 @@ struct Decoder<'a> {
     /// Table id plus one for each decoded object, by slot. An object is only ever decoded as
     /// one of name, level or expression, so the kinds can share it.
     memo: Vec<u32>,
+    /// Leave theorem values in the olean.
+    lazy: bool,
+}
+
+/// A step of [`Env::walk`].
+#[derive(Clone, Copy)]
+enum Item {
+    Const(NameId),
+    Expr(ExprId),
+}
+
+/// What [`Env::walk`] has visited, kept across its rounds.
+#[derive(Default)]
+struct Walk {
+    consts: FxHashSet<NameId>,
+    exprs: Vec<bool>,
 }
 
 /// The memo mark of an expression whose subterms are still being decoded.
 const PENDING: u32 = u32::MAX;
 
-impl Decoder<'_> {
+impl<'a> Decoder<'a> {
+    fn new(
+        img: &'a Image,
+        tables: &'a Tables,
+        rank: u32,
+        cursor: &'a mut Option<usize>,
+        lazy: bool,
+    ) -> Self {
+        Self {
+            img,
+            tables,
+            rank,
+            cursor,
+            memo: vec![0; img.slots()],
+            module: Module {
+                consts: Vec::new(),
+                recursors: FxHashMap::default(),
+                skipped: 0,
+                header: img.header.clone(),
+                pending: Vec::new(),
+            },
+            lazy,
+        }
+    }
+
     fn run(&mut self) -> Result<()> {
         let img = self.img;
         for c in img.array(img.field(img.root, 2)?)? {
@@ -1188,8 +1404,13 @@ impl Decoder<'_> {
                     all: self.names(f(3)?)?,
                 })
             }
-            2 => Kind::Thm(Body {
-                value: self.expr(f(1)?)?,
+            2 => Kind::Thm(Theorem {
+                value: if self.lazy {
+                    self.module.pending.push((name, f(1)?));
+                    None
+                } else {
+                    Some(self.expr(f(1)?)?)
+                },
                 all: self.names(f(2)?)?,
             }),
             3 => Kind::Opaque(Body {

@@ -53,6 +53,9 @@ struct Cli {
     /// No progress bars or summary
     #[arg(short, long)]
     quiet: bool,
+    /// Show peak resident memory in the progress bars and summary
+    #[arg(long)]
+    rss: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -82,6 +85,14 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Compare two exports, NDJSON or blean, up to id numbering and record order
+    Compare {
+        a: PathBuf,
+        b: PathBuf,
+        /// Show at most N names per list
+        #[arg(short = 'n', long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 struct Counting<W> {
@@ -106,6 +117,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
         Some(Command::Convert { input, output }) => convert(input, output.as_ref()),
+        Some(Command::Compare { a, b, limit }) => compare(a, b, *limit),
         None => run(&cli),
     };
     match result {
@@ -120,6 +132,36 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Peak resident set so far, if the platform reports it.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn peak_rss() -> Option<u64> {
+    // SAFETY: rusage is plain integers, for which zero is valid, and getrusage only writes it.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut u) } != 0 {
+        return None;
+    }
+    let n = u64::try_from(u.ru_maxrss).ok()?;
+    // bytes on macOS, KiB elsewhere
+    Some(if cfg!(target_os = "macos") {
+        n
+    } else {
+        n << 10
+    })
+}
+
+#[cfg(not(unix))]
+const fn peak_rss() -> Option<u64> {
+    None
+}
+
+fn rss(on: bool) -> String {
+    match peak_rss() {
+        Some(n) if on => format!(", peak {}", HumanBytes(n)),
+        _ => String::new(),
     }
 }
 
@@ -243,13 +285,20 @@ fn run(cli: &Cli) -> Res {
         .jobs
         .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
     pb.set_message(format!("finding modules, {jobs} threads"));
-    let env = Env::load_with(&search, &roots, jobs, &|modules, consts| {
+    let tick = |modules: usize, consts: usize| {
         pb.set_message(format!(
-            "{} modules, {} constants",
+            "{} modules, {} constants{}",
             HumanCount(modules as u64),
-            HumanCount(consts as u64)
+            HumanCount(consts as u64),
+            rss(cli.rss)
         ));
-    })?;
+    };
+    let env = if cli.consts.is_empty() {
+        Env::load_with(&search, &roots, jobs, &tick)?
+    } else {
+        let consts: Vec<&str> = cli.consts.iter().map(String::as_str).collect();
+        Env::load_cone(&search, &roots, &consts, jobs, &tick)?
+    };
     pb.finish_and_clear();
     let loaded = start.elapsed();
 
@@ -284,7 +333,7 @@ fn run(cli: &Cli) -> Res {
     );
     let tick = |i: usize| {
         pb.set_position(i as u64);
-        pb.set_message(HumanBytes(bytes.get()).to_string());
+        pb.set_message(format!("{}{}", HumanBytes(bytes.get()), rss(cli.rss)));
     };
     let counts = match cli.format {
         Format::Ndjson => export(Exporter::new(&env, out), &targets, tick)?,
@@ -296,7 +345,7 @@ fn run(cli: &Cli) -> Res {
         let ms = start.elapsed().saturating_sub(loaded).as_millis().max(1);
         let rate = u64::try_from(u128::from(bytes.get()) * 1000 / ms).unwrap_or(u64::MAX);
         eprintln!(
-            "{} modules, {} constants decoded in {:.2}s\n{} of {} ({} names, {} levels, {} exprs) in {:.2}s total, {}/s",
+            "{} modules, {} constants decoded in {:.2}s\n{} of {} ({} names, {} levels, {} exprs) in {:.2}s total, {}/s{}",
             HumanCount(env.modules.len() as u64),
             HumanCount(env.consts.len() as u64),
             loaded.as_secs_f64(),
@@ -310,6 +359,7 @@ fn run(cli: &Cli) -> Res {
             HumanCount(counts.exprs.into()),
             start.elapsed().as_secs_f64(),
             HumanBytes(rate),
+            rss(cli.rss),
         );
     }
     Ok(())
@@ -332,11 +382,52 @@ fn export<S: Sink>(
     Ok(counts)
 }
 
-fn convert(input: &PathBuf, output: Option<&PathBuf>) -> Res {
-    let file = File::open(input)?;
-    // SAFETY: the export is only read, and is not expected to change while converting.
+fn mmap(path: &PathBuf) -> io::Result<memmap2::Mmap> {
+    let file = File::open(path)?;
+    // SAFETY: the export is only read, and is not expected to change while it is.
     #[allow(unsafe_code)]
-    let map = unsafe { memmap2::Mmap::map(&file)? };
+    unsafe {
+        memmap2::Mmap::map(&file)
+    }
+}
+
+fn compare(a: &PathBuf, b: &PathBuf, limit: usize) -> Res {
+    let d = olean_export::compare(&mmap(a)?, &mmap(b)?)?;
+    let mut out = io::stdout().lock();
+    let mut list = |what: &str, names: &[String]| -> io::Result<()> {
+        for n in names.iter().take(limit) {
+            writeln!(out, "{what}: {n}")?;
+        }
+        if names.len() > limit {
+            writeln!(out, "{what}: ... {} more", names.len() - limit)?;
+        }
+        Ok(())
+    };
+    list(&format!("only in {}", a.display()), &d.only_a)?;
+    list(&format!("only in {}", b.display()), &d.only_b)?;
+    let differ: Vec<String> = d.differ.iter().map(|(n, w)| format!("{n} ({w})")).collect();
+    list("differs", &differ)?;
+    list(&format!("duplicate in {}", a.display()), &d.dups.0)?;
+    list(&format!("duplicate in {}", b.display()), &d.dups.1)?;
+    writeln!(
+        out,
+        "{} / {} declarations: {} only in the first, {} only in the second, {} differ, {} duplicate",
+        d.decls.0,
+        d.decls.1,
+        d.only_a.len(),
+        d.only_b.len(),
+        d.differ.len(),
+        d.dups.0.len() + d.dups.1.len()
+    )?;
+    if d.is_empty() {
+        Ok(())
+    } else {
+        Err("the exports differ".into())
+    }
+}
+
+fn convert(input: &PathBuf, output: Option<&PathBuf>) -> Res {
+    let map = mmap(input)?;
     let sink: Box<dyn Write> = match output {
         Some(path) => Box::new(File::create(path)?),
         None => Box::new(io::stdout().lock()),

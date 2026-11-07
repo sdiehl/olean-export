@@ -53,7 +53,7 @@ lake env olean-export Hello -c double_two -f blean -o hello.blean
 
 ## Performance
 
-Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`.
+Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`. With `-c`, theorem values outside the cone stay undecoded. `--rss` shows peak resident memory.
 
 Wall time:
 
@@ -71,7 +71,7 @@ Peak memory:
 
 ## Inspect
 
-`inspect` summarizes one module's olean, by name or path, without decoding any terms: the Lean release, the module system parts, imports, constant kinds, and how many bytes each section and environment extension holds. Shared objects count toward the first section that reaches them, constants first. Pass `-c` to list every constant.
+`inspect` summarizes an olean's imports, constants and bytes per section. `-c` lists every constant.
 
 ```bash
 $ olean-export inspect tests/cases/build/Top.olean
@@ -88,6 +88,17 @@ constants (24): 8 def, 6 ctor, 4 inductive, 4 recursor, 2 theorem
    1.66 KiB    4.2%       7  Lean.declRangeExt
    1.09 KiB    2.8%      24  _private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt
    ...
+```
+
+## Compare
+
+`compare` diffs two exports, NDJSON or blean, ignoring record order, ids and binders.
+
+```bash
+$ lean4export Top > want.ndjson
+$ olean-export Top -f blean -o got.blean
+$ olean-export compare want.ndjson got.blean
+33 / 33 declarations: 0 only in the first, 0 only in the second, 0 differ, 0 duplicate
 ```
 
 ## License

@@ -439,6 +439,7 @@ dependencies = [
  "indicatif",
  "insta",
  "itoa",
+ "libc",
  "memmap2",
  "mimalloc",
  "parking_lot",
