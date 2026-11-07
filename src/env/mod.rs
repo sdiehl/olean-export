@@ -23,6 +23,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
+    borrow::Cow,
     env,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering::Relaxed},
@@ -47,6 +48,42 @@ pub struct Env {
     ends: Vec<usize>,
     pub(crate) lineage: u64,
     live: Option<Box<Live>>,
+}
+
+/// Identifier-shaped tokens of Lean's term syntax, which a name must not print as.
+const KEYWORDS: &[&str] = &[
+    "Prop", "Sort", "Type", "at", "by", "calc", "do", "else", "end", "forall", "from", "fun",
+    "have", "if", "in", "let", "match", "nofun", "nomatch", "open", "show", "sorry", "suffices",
+    "then", "this", "where", "with",
+];
+
+/// A name component in `«»` unless Lean would read it back as itself unescaped. Lean has no
+/// way to write a `»` in a name, so `»` and `\` are written after a `\`, which no name Lean
+/// can print contains.
+pub(crate) fn escape(s: &str) -> Cow<'_, str> {
+    let letter = |c: char| {
+        let u = u32::from(c);
+        c.is_ascii_alphabetic()
+            || c == '_'
+            || ((0x3b1..=0x3c9).contains(&u) && u != 0x3bb)
+            || ((0x391..=0x3a9).contains(&u) && u != 0x3a0 && u != 0x3a3)
+            || matches!(u, 0x3ca..=0x3fb | 0x1f00..=0x1ffe | 0x2100..=0x214f | 0x1d49c..=0x1d59f)
+    };
+    let rest = |c: char| {
+        letter(c)
+            || c.is_ascii_digit()
+            || matches!(c, '\'' | '!' | '?')
+            || matches!(u32::from(c), 0x2080..=0x2089 | 0x2090..=0x209c | 0x1d62..=0x1d6a | 0x2c7c)
+    };
+    let mut cs = s.chars();
+    let plain = cs.next().is_some_and(letter) && cs.all(rest) && !KEYWORDS.contains(&s);
+    if plain {
+        Cow::Borrowed(s)
+    } else if s.contains(['»', '\\']) {
+        Cow::Owned(format!("«{}»", s.replace('\\', "\\\\").replace('»', "\\»")))
+    } else {
+        Cow::Owned(format!("«{s}»"))
+    }
 }
 
 fn discover_all(search: &[PathBuf], roots: &[&str]) -> Result<Vec<(String, PathBuf)>> {
@@ -223,25 +260,59 @@ impl Env {
         self.order.iter().copied().filter(|&c| !self.is_internal(c))
     }
 
-    /// Look up a dotted name such as `Nat.add` without interning it.
+    /// Look up a name such as `Nat.add` or `Foo.«bar.baz»`, as [`Env::display`] writes it,
+    /// without interning it.
     #[must_use]
     pub fn find_name(&self, dotted: &str) -> Option<NameId> {
-        dotted.split('.').try_fold(ANON, |pre, s| {
-            let n = s
-                .parse()
-                .map_or_else(|_| Name::Str(pre, s.into()), |i| Name::Num(pre, i));
-            self.names.get(&n)
-        })
+        let (mut pre, mut rest) = (ANON, dotted);
+        loop {
+            let (n, tail) = if let Some(r) = rest.strip_prefix('«') {
+                let (mut s, mut cs) = (String::new(), r.char_indices());
+                let end = loop {
+                    match cs.next()? {
+                        (_, '\\') => s.push(cs.next()?.1),
+                        (i, '»') => break i + '»'.len_utf8(),
+                        (_, c) => s.push(c),
+                    }
+                };
+                (Name::Str(pre, s.into()), &r[end..])
+            } else {
+                let (s, tail) = rest.split_at(rest.find('.').unwrap_or(rest.len()));
+                let n = s
+                    .parse()
+                    .map_or_else(|_| Name::Str(pre, s.into()), |i| Name::Num(pre, i));
+                (n, tail)
+            };
+            pre = self.names.get(&n)?;
+            match tail.strip_prefix('.') {
+                Some(t) => rest = t,
+                None => return tail.is_empty().then_some(pre),
+            }
+        }
     }
 
+    /// `n` as Lean reads it back: components that are not plain identifiers, or are
+    /// keywords, go in `«»`.
     #[must_use]
     pub fn display(&self, n: NameId) -> String {
-        match &self.names[n] {
-            Name::Anon => String::new(),
-            Name::Str(ANON, s) => s.to_string(),
-            Name::Num(ANON, i) => i.to_string(),
-            Name::Str(p, s) => format!("{}.{s}", self.display(*p)),
-            Name::Num(p, i) => format!("{}.{i}", self.display(*p)),
+        self.join(n, true)
+    }
+
+    /// `n` with its components joined as they are, as `declRangeExt` keys it.
+    pub(crate) fn dotted(&self, n: NameId) -> String {
+        self.join(n, false)
+    }
+
+    fn join(&self, n: NameId, escaped: bool) -> String {
+        let (pre, last) = match &self.names[n] {
+            Name::Anon => return String::new(),
+            Name::Str(p, s) if escaped => (*p, escape(s).into_owned()),
+            Name::Str(p, s) => (*p, s.to_string()),
+            Name::Num(p, i) => (*p, i.to_string()),
+        };
+        match pre {
+            ANON => last,
+            p => format!("{}.{last}", self.join(p, escaped)),
         }
     }
 

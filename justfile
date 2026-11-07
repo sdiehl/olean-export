@@ -24,3 +24,12 @@ fixtures toolchain="leanprover/lean4:v4.35.0-rc3":
         (cd edit && LEAN_PATH=../build lean -o ../build/edit/$m.olean $m.lean)
     done
     rm -f build/*.ir build/*.ir.sig build/edit/*.ir build/edit/*.ir.sig
+
+# Check the statement cone of each fixture theorem with a kernel, theorems taken as axioms.
+kernel checker="nl-fast" toolchain="leanprover/lean4:v4.35.0-rc3":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export LEAN_PATH=tests/cases/build:$(lean +{{toolchain}} --print-libdir)
+    for c in Top:N.add_zero Top:letty Top:Even Pinned:pinned Pinned:shadow 'Pinned:«fun»'; do
+        cargo run -q -- statement -f ndjson -c "${c#*:}" "${c%%:*}" | {{checker}} -
+    done

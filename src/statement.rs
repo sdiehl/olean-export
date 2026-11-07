@@ -1,17 +1,21 @@
 //! What a theorem's statement rests on, printed as raw terms for a person to review.
 //!
 //! Notation, coercions and macros never reach an olean, so the terms print as the kernel
-//! sees them, in Lean syntax but without notation. Binder names are only labels: they come
-//! from one of the copies of a shared term, and are renamed apart from each other and from
-//! every constant, so that no name reads as something it is not.
+//! sees them, in Lean syntax but without notation. A name Lean would not read back as itself
+//! goes in `«»`. Binder names are only labels, from one of the copies of a shared term, so
+//! they are renamed apart from each other and from the first component of every constant,
+//! and no name reads as something it is not.
 
 use crate::{
-    env::{resolve, Binder, Env, Expr, ExprId, Hints, Kind, Level, LevelId, NameId},
+    env::{
+        escape, resolve, Binder, Env, Expr, ExprId, Hints, Kind, Level, LevelId, Name, NameId, ANON,
+    },
     error::Result,
     olean::{small_nat, Image},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
+    borrow::Cow,
     collections::hash_map::Entry,
     fmt::Write as _,
     io::Write,
@@ -22,8 +26,10 @@ use std::{
 /// Print the statements of `roots` and what they rest on, outside the modules `trust` names.
 ///
 /// Every definition, inductive, opaque, axiom and theorem reached prints in load order with
-/// the lines of source it came from, theorems without their proofs. A module is trusted if a name in `trust` is it or a prefix of it.
-/// Each term stops after `max` characters, if not 0.
+/// the lines of source it came from, theorems without their proofs. A module is trusted if a
+/// name in `trust` is it or a prefix of it. Every axiom is named in the header, trusted or
+/// not, but trusted theorems are only counted. Each term stops after `max` characters, if
+/// not 0.
 pub fn report(
     env: &Env,
     search: &[PathBuf],
@@ -50,20 +56,27 @@ pub fn report(
         .copied()
         .filter(listed)
         .partition(|&(m, _)| trusted(m));
-    let named = |pick: fn(&Kind) -> bool| {
-        let names: Vec<String> = cone
-            .iter()
-            .filter(|&&(_, c)| !roots.contains(&c) && pick(&env.consts[&c].kind))
-            .map(|&(_, c)| env.display(c))
-            .collect();
+    let named = |pick: fn(&Kind) -> bool, all: bool| {
+        let (mut names, mut more) = (Vec::new(), 0);
+        for &(m, c) in &cone {
+            if roots.contains(&c) || !pick(&env.consts[&c].kind) {
+            } else if all || !trusted(m) {
+                names.push(env.display(c));
+            } else {
+                more += 1;
+            }
+        }
+        if more > 0 {
+            names.push(format!("{more} more in {}", trust.join(", ")));
+        }
         if names.is_empty() {
             "none".into()
         } else {
             names.join(", ")
         }
     };
-    let axioms = named(|k| matches!(k, Kind::Axiom));
-    let assumed = named(|k| matches!(k, Kind::Thm(_)));
+    let axioms = named(|k| matches!(k, Kind::Axiom), true);
+    let assumed = named(|k| matches!(k, Kind::Thm(_)), false);
     let mut modules: Vec<usize> = shown.iter().map(|&(m, _)| m).collect();
     modules.dedup();
     let names: Vec<String> = roots.iter().map(|&c| env.display(c)).collect();
@@ -92,7 +105,7 @@ pub fn report(
             e.insert(ranges(&resolve(search, module)?)?);
         }
         let file = format!("{}.lean", module.replace('.', "/"));
-        let at = match lines[&m].get(&env.display(c)) {
+        let at = match lines[&m].get(&env.dotted(c)) {
             Some((a, b)) if a == b => format!("{file}:{a}"),
             Some((a, b)) => format!("{file}:{a}-{b}"),
             None => file,
@@ -127,6 +140,8 @@ struct Printer<'e> {
     out: String,
     scope: Vec<String>,
     loose: FxHashMap<ExprId, u64>,
+    /// The first component of every constant's name.
+    heads: FxHashSet<NameId>,
 }
 
 /// Contexts, loosest first: a binder body, an arrow's domain, an application's argument.
@@ -137,7 +152,8 @@ const ARG: u8 = 2;
 /// A step of printing a term, kept on a stack since terms can be deeper than the call stack.
 enum Step {
     Expr(ExprId, u8),
-    Text(String),
+    Level(LevelId, bool),
+    Text(Cow<'static, str>),
     /// The rest of a run of binders, ending at `sep` with the scope back at `depth`.
     Binders {
         e: ExprId,
@@ -149,14 +165,41 @@ enum Step {
     Unbind(usize),
 }
 
+const fn text(s: &'static str) -> Step {
+    Step::Text(Cow::Borrowed(s))
+}
+
+/// Push `items` to print in order, in parentheses if `on`.
+fn emit<const N: usize>(todo: &mut Vec<Step>, on: bool, items: [Step; N]) {
+    if on {
+        todo.push(text(")"));
+    }
+    todo.extend(items.into_iter().rev());
+    if on {
+        todo.push(text("("));
+    }
+}
+
 impl<'e> Printer<'e> {
     fn new(env: &'e Env, max: usize) -> Self {
+        let mut heads = FxHashSet::default();
+        for &c in env.consts.keys() {
+            let mut n = c;
+            while let Name::Str(p, _) | Name::Num(p, _) = env.names[n] {
+                if p == ANON {
+                    break;
+                }
+                n = p;
+            }
+            heads.insert(n);
+        }
         Self {
             env,
             max,
             out: String::new(),
             scope: Vec::new(),
             loose: FxHashMap::default(),
+            heads,
         }
     }
 
@@ -223,107 +266,110 @@ impl<'e> Printer<'e> {
         s
     }
 
+    /// Print what `step` can at once, pushing the rest to `todo` in reverse.
     fn step(&mut self, step: Step, todo: &mut Vec<Step>) {
         let env = self.env;
-        let text = |s: &str| Step::Text(s.to_owned());
-        let paren = |on: bool, mut steps: Vec<Step>| {
-            if on {
-                steps.insert(0, text("("));
-                steps.push(text(")"));
-            }
-            steps
-        };
         let depth = self.scope.len();
-        let steps = match step {
-            Step::Text(s) => {
-                self.out.push_str(&s);
-                return;
+        match step {
+            Step::Text(s) => self.out.push_str(&s),
+            Step::Bind(x) => self.scope.push(x),
+            Step::Unbind(d) => self.scope.truncate(d),
+            Step::Level(l, arg) => self.level(l, arg, todo),
+            Step::Binders { e, lam, sep, depth } => {
+                let Some((n, ty, body, bi)) = self.binder(e, lam) else {
+                    self.out.push_str(sep);
+                    return emit(todo, false, [Step::Expr(e, TOP), Step::Unbind(depth)]);
+                };
+                let x = self.fresh(n);
+                let (l, r) = match bi {
+                    Binder::Default => ("(", ")"),
+                    Binder::Implicit => ("{", "}"),
+                    Binder::StrictImplicit => ("⦃", "⦄"),
+                    Binder::InstImplicit => ("[", "]"),
+                };
+                write!(self.out, " {l}{x} : ").expect("string");
+                let rest = Step::Binders {
+                    e: body,
+                    lam,
+                    sep,
+                    depth,
+                };
+                emit(
+                    todo,
+                    false,
+                    [Step::Expr(ty, TOP), text(r), Step::Bind(x), rest],
+                );
             }
-            Step::Bind(x) => {
-                self.scope.push(x);
-                return;
-            }
-            Step::Unbind(d) => {
-                self.scope.truncate(d);
-                return;
-            }
-            Step::Binders { e, lam, sep, depth } => match self.binder(e, lam) {
-                Some((n, ty, body, bi)) => {
-                    let x = self.fresh(n);
-                    let (l, r) = match bi {
-                        Binder::Default => ("(", ")"),
-                        Binder::Implicit => ("{", "}"),
-                        Binder::StrictImplicit => ("⦃", "⦄"),
-                        Binder::InstImplicit => ("[", "]"),
-                    };
-                    vec![
-                        Step::Text(format!(" {l}{x} : ")),
-                        Step::Expr(ty, TOP),
-                        text(r),
-                        Step::Bind(x),
-                        Step::Binders {
-                            e: body,
-                            lam,
-                            sep,
-                            depth,
-                        },
-                    ]
-                }
-                None => vec![text(sep), Step::Expr(e, TOP), Step::Unbind(depth)],
-            },
             Step::Expr(e, prec) => match &env.exprs[e] {
                 Expr::BVar(i) => {
-                    let name = usize::try_from(*i)
+                    match usize::try_from(*i)
                         .ok()
                         .and_then(|i| depth.checked_sub(i + 1))
-                        .map_or_else(|| format!("#{i}"), |j| self.scope[j].clone());
-                    vec![Step::Text(name)]
-                }
-                Expr::Sort(l) => {
-                    let s = sort(env, *l);
-                    paren(prec >= ARG && s.contains(' '), vec![Step::Text(s)])
-                }
-                Expr::Const(n, us) => {
-                    let mut s = env.display(*n);
-                    if !us.is_empty() {
-                        let us: Vec<String> = us.iter().map(|&u| level(env, u, false)).collect();
-                        write!(s, ".{{{}}}", us.join(", ")).expect("string");
+                    {
+                        Some(j) => self.out.push_str(&self.scope[j]),
+                        None => write!(self.out, "#{i}").expect("string"),
                     }
-                    vec![Step::Text(s)]
+                }
+                Expr::Sort(l) => match env.levels[*l] {
+                    Level::Zero => self.out.push_str("Prop"),
+                    Level::Succ(u) if env.levels[u] == Level::Zero => self.out.push_str("Type"),
+                    ref k => {
+                        let (word, u) = match *k {
+                            Level::Succ(u) => ("Type ", u),
+                            _ => ("Sort ", *l),
+                        };
+                        emit(todo, prec >= ARG, [text(word), Step::Level(u, true)]);
+                    }
+                },
+                Expr::Const(n, us) => {
+                    self.out.push_str(&env.display(*n));
+                    if let Some((first, rest)) = us.split_first() {
+                        self.out.push_str(".{");
+                        todo.push(text("}"));
+                        for &u in rest.iter().rev() {
+                            todo.extend([Step::Level(u, false), text(", ")]);
+                        }
+                        todo.push(Step::Level(*first, false));
+                    }
                 }
                 Expr::App(..) => {
-                    let mut args = Vec::new();
+                    let on = prec >= ARG;
+                    if on {
+                        todo.push(text(")"));
+                    }
                     let mut f = e;
-                    while let Expr::App(g, a) = &env.exprs[f] {
-                        args.push(*a);
-                        f = *g;
+                    while let Expr::App(g, a) = env.exprs[f] {
+                        todo.extend([Step::Expr(a, ARG), text(" ")]);
+                        f = g;
                     }
-                    let mut steps = vec![Step::Expr(f, ARG)];
-                    for &a in args.iter().rev() {
-                        steps.extend([text(" "), Step::Expr(a, ARG)]);
+                    todo.push(Step::Expr(f, ARG));
+                    if on {
+                        todo.push(text("("));
                     }
-                    paren(prec >= ARG, steps)
                 }
                 Expr::Pi(_, ty, body, bi) if *bi == Binder::Default && self.range(*body) == 0 => {
-                    let steps = vec![
+                    let items = [
                         Step::Expr(*ty, DOMAIN),
                         text(" → "),
                         Step::Bind(String::new()),
                         Step::Expr(*body, TOP),
                         Step::Unbind(depth),
                     ];
-                    paren(prec > TOP, steps)
+                    emit(todo, prec > TOP, items);
                 }
                 Expr::Lam(..) | Expr::Pi(..) => {
                     let lam = matches!(env.exprs[e], Expr::Lam(..));
                     let (word, sep) = if lam { ("fun", " => ") } else { ("∀", ", ") };
-                    let steps = vec![text(word), Step::Binders { e, lam, sep, depth }];
-                    paren(prec > TOP, steps)
+                    emit(
+                        todo,
+                        prec > TOP,
+                        [text(word), Step::Binders { e, lam, sep, depth }],
+                    );
                 }
                 Expr::Let(n, ty, v, body) => {
                     let x = self.fresh(*n);
-                    let steps = vec![
-                        Step::Text(format!("let {x} : ")),
+                    let items = [
+                        Step::Text(format!("let {x} : ").into()),
                         Step::Expr(*ty, TOP),
                         text(" := "),
                         Step::Expr(*v, TOP),
@@ -332,14 +378,59 @@ impl<'e> Printer<'e> {
                         Step::Expr(*body, TOP),
                         Step::Unbind(depth),
                     ];
-                    paren(prec > TOP, steps)
+                    emit(todo, prec > TOP, items);
                 }
-                Expr::Nat(n) => vec![Step::Text(n.to_string())],
-                Expr::Str(s) => vec![Step::Text(quote(s))],
-                Expr::Proj(_, i, x) => vec![Step::Expr(*x, ARG), Step::Text(format!(".{}", i + 1))],
+                Expr::Nat(n) => write!(self.out, "{n}").expect("string"),
+                Expr::Str(s) => quote(&mut self.out, s),
+                Expr::Proj(_, i, x) => {
+                    todo.extend([
+                        Step::Text(format!(".{}", i + 1).into()),
+                        Step::Expr(*x, ARG),
+                    ]);
+                }
             },
-        };
-        todo.extend(steps.into_iter().rev());
+        }
+    }
+
+    /// A universe, in parentheses if it is an `arg` of more than one token.
+    fn level(&mut self, l: LevelId, arg: bool, todo: &mut Vec<Step>) {
+        let env = self.env;
+        let mut n = 0;
+        let mut base = l;
+        while let Level::Succ(u) = env.levels[base] {
+            n += 1;
+            base = u;
+        }
+        let plus = || Step::Text(format!(" + {n}").into());
+        match env.levels[base] {
+            Level::Zero => write!(self.out, "{n}").expect("string"),
+            Level::Param(p) if n == 0 => self.out.push_str(&env.display(p)),
+            Level::Param(p) => emit(todo, arg, [Step::Text(env.display(p).into()), plus()]),
+            Level::Max(a, b) | Level::IMax(a, b) => {
+                let word = if matches!(env.levels[base], Level::Max(..)) {
+                    "max "
+                } else {
+                    "imax "
+                };
+                if n > 0 {
+                    if arg {
+                        todo.push(text(")"));
+                    }
+                    todo.push(plus());
+                }
+                let items = [
+                    text(word),
+                    Step::Level(a, true),
+                    text(" "),
+                    Step::Level(b, true),
+                ];
+                emit(todo, arg, items);
+                if n > 0 && arg {
+                    todo.push(text("("));
+                }
+            }
+            Level::Succ(_) => unreachable!("peeled"),
+        }
     }
 
     /// The binder at `e` if it continues a run of lambdas, or of dependent or non-default pis.
@@ -394,18 +485,19 @@ impl<'e> Printer<'e> {
         self.loose[&e]
     }
 
-    /// The binder's name without hygiene, made distinct from every name in scope and every
-    /// constant.
+    /// The binder's name without hygiene, as one component, distinct from every name in
+    /// scope and from the first component of every constant, which it would shadow.
     fn fresh(&self, n: NameId) -> String {
         let env = self.env;
-        let full = env.display(n);
+        let full = env.dotted(n);
         let base = full.split("._@").next().unwrap_or_default();
         let base = if base.is_empty() { "x" } else { base };
         let taken = |x: &str| {
-            self.scope.iter().any(|s| s == x)
+            self.scope.iter().any(|s| *s == escape(x))
                 || env
-                    .find_name(x)
-                    .is_some_and(|c| env.consts.contains_key(&c))
+                    .names
+                    .get(&Name::Str(ANON, x.into()))
+                    .is_some_and(|h| self.heads.contains(&h))
         };
         let mut x = base.to_owned();
         let mut i = 1;
@@ -413,13 +505,13 @@ impl<'e> Printer<'e> {
             x = format!("{base}_{i}");
             i += 1;
         }
-        x
+        escape(&x).into_owned()
     }
 }
 
 /// `s` as a Lean string literal.
-fn quote(s: &str) -> String {
-    let mut q = String::from('"');
+fn quote(q: &mut String, s: &str) {
+    q.push('"');
     for c in s.chars() {
         match c {
             '"' => q.push_str("\\\""),
@@ -432,44 +524,4 @@ fn quote(s: &str) -> String {
         }
     }
     q.push('"');
-    q
-}
-
-fn sort(env: &Env, l: LevelId) -> String {
-    match &env.levels[l] {
-        Level::Zero => "Prop".into(),
-        Level::Succ(u) if matches!(env.levels[*u], Level::Zero) => "Type".into(),
-        Level::Succ(u) => format!("Type {}", level(env, *u, true)),
-        _ => format!("Sort {}", level(env, l, true)),
-    }
-}
-
-fn level(env: &Env, l: LevelId, arg: bool) -> String {
-    let mut n = 0;
-    let mut base = l;
-    while let Level::Succ(u) = &env.levels[base] {
-        n += 1;
-        base = *u;
-    }
-    let paren = |s: String| if arg { format!("({s})") } else { s };
-    let b = match &env.levels[base] {
-        Level::Zero => return n.to_string(),
-        Level::Param(p) => env.display(*p),
-        Level::Max(a, b) => paren(format!(
-            "max {} {}",
-            level(env, *a, true),
-            level(env, *b, true)
-        )),
-        Level::IMax(a, b) => paren(format!(
-            "imax {} {}",
-            level(env, *a, true),
-            level(env, *b, true)
-        )),
-        Level::Succ(_) => unreachable!("peeled"),
-    };
-    if n == 0 {
-        b
-    } else {
-        paren(format!("{b} + {n}"))
-    }
 }

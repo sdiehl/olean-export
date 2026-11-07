@@ -61,7 +61,7 @@ inductive Nat : Type
 | Nat.zero : Nat
 | Nat.succ : Nat → Nat
 
--- pinned, shadow rests on 5 declarations in 2 modules, and 0 more in Init
+-- pinned, shadow, «fun» rests on 6 declarations in 2 modules, and 0 more in Init
 -- axioms: none
 -- theorems taken as stated: N.add_zero
 
@@ -72,6 +72,10 @@ def pinned : Pinned :=
 -- Pinned.lean:12
 def shadow : ∀ (N_1 : Type) (x : N_1), N_1 :=
   fun (N_1 : Type) (x : N_1) => x
+
+-- Pinned.lean:16
+def «fun» : N → N :=
+  fun («Prop» : N) => N.add «N.add» «Prop»
 
 -- Base.lean:12-13
 inductive Eq.{u} : ∀ {α : Sort u} (a : α), α → Prop
@@ -92,5 +96,9 @@ def N.add : N → N → N :=
 -- Pinned.lean:6-8
 inductive Pinned : Type
 | Pinned.mk : ∀ (n : N), Eq.{1} N (N.add n N.zero) n → Pinned
+
+-- Pinned.lean:14
+def «N.add» : N :=
+  N.zero
 
 exported: inductive, inductive, def, axiom, inductive, def

@@ -8,9 +8,15 @@ use crate::{
     },
 };
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{
+    de::{self, MapAccess, Visitor},
+    Deserialize, Deserializer,
+};
 use serde_json::value::RawValue;
-use std::io::{self, BufRead, Write};
+use std::{
+    fmt,
+    io::{self, BufRead, Write},
+};
 
 /// Writes records as NDJSON lines, byte for byte as lean4export does.
 #[derive(Debug)]
@@ -518,7 +524,8 @@ fn parse(lines: &[String], base: usize) -> Result<Option<Parsed>> {
                 let m: Meta<'_> = serde_json::from_str(line).map_err(at)?;
                 (None, Record::Meta(m.meta.get().to_owned().into()))
             } else {
-                serde_json::from_str::<Line>(line).map_err(at)?.record()
+                let Line(id, r) = serde_json::from_str(line).map_err(at)?;
+                (id, r)
             };
             Ok((n, id, r))
         })
@@ -532,42 +539,171 @@ struct Meta<'a> {
     meta: &'a RawValue,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Line {
-    Name {
-        #[serde(rename = "in")]
-        id: u32,
-        #[serde(flatten)]
-        name: JName,
-    },
-    Level {
-        il: u32,
-        #[serde(flatten)]
-        level: JLevel,
-    },
-    Expr {
-        ie: u32,
-        #[serde(flatten)]
-        expr: JExpr,
-    },
-    Decl(JDecl),
+/// One non-meta line: its id, if it is not a declaration, and its record.
+struct Line(Option<u32>, Record<'static>);
+
+impl<'de> Deserialize<'de> for Line {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        d.deserialize_map(LineVisitor)
+    }
+}
+
+const KEYS: &[&str] = &[
+    "in",
+    "il",
+    "ie",
+    "str",
+    "num",
+    "succ",
+    "max",
+    "imax",
+    "param",
+    "bvar",
+    "sort",
+    "const",
+    "app",
+    "lam",
+    "forallE",
+    "letE",
+    "natVal",
+    "strVal",
+    "proj",
+    "mdata",
+    "axiom",
+    "def",
+    "thm",
+    "opaque",
+    "quot",
+    "inductive",
+];
+
+struct LineVisitor;
+
+impl<'de> Visitor<'de> for LineVisitor {
+    type Value = Line;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a lean4export record")
+    }
+
+    /// Each key names the shape of its value, so the line parses in one pass whatever order
+    /// its keys come in.
+    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> std::result::Result<Line, A::Error> {
+        let (mut id, mut rec) = (None, None);
+        while let Some(k) = m.next_key::<&str>()? {
+            let r = match k {
+                "in" | "il" | "ie" => {
+                    id = Some(m.next_value()?);
+                    continue;
+                }
+                "str" => {
+                    let JStr { pre, str } = m.next_value()?;
+                    Record::NameStr {
+                        pre,
+                        str: str.into(),
+                    }
+                }
+                "num" => {
+                    let JNum { pre, i } = m.next_value()?;
+                    Record::NameNum { pre, i }
+                }
+                "succ" => Record::Succ(m.next_value()?),
+                "max" => {
+                    let (a, b) = m.next_value()?;
+                    Record::Max(a, b)
+                }
+                "imax" => {
+                    let (a, b) = m.next_value()?;
+                    Record::IMax(a, b)
+                }
+                "param" => Record::Param(m.next_value()?),
+                "bvar" => Record::BVar(m.next_value()?),
+                "sort" => Record::Sort(m.next_value()?),
+                "const" => {
+                    let JConst { name, us } = m.next_value()?;
+                    Record::Const { name, us }
+                }
+                "app" => {
+                    let JApp { fun, arg } = m.next_value()?;
+                    Record::App { fun, arg }
+                }
+                "lam" => Record::Lam(m.next_value::<JBinding>()?.into()),
+                "forallE" => Record::Pi(m.next_value::<JBinding>()?.into()),
+                "letE" => {
+                    let JLet {
+                        name,
+                        ty,
+                        value,
+                        body,
+                        nondep,
+                    } = m.next_value()?;
+                    Record::Let {
+                        name,
+                        ty,
+                        value,
+                        body,
+                        nondep,
+                    }
+                }
+                "natVal" => Record::Nat(m.next_value::<String>()?.into()),
+                "strVal" => Record::Str(m.next_value::<String>()?.into()),
+                "proj" => {
+                    let JProj {
+                        type_name,
+                        idx,
+                        struct_,
+                    } = m.next_value()?;
+                    Record::Proj {
+                        type_name,
+                        idx,
+                        struct_,
+                    }
+                }
+                "mdata" => Record::MData(m.next_value::<JMdata>()?.expr),
+                "axiom" => Record::Decl(m.next_value::<JAxiom>()?.into()),
+                "def" => Record::Decl(m.next_value::<JDef>()?.into()),
+                "thm" => Record::Decl(m.next_value::<JThm>()?.into()),
+                "opaque" => Record::Decl(m.next_value::<JOpaque>()?.into()),
+                "quot" => Record::Decl(m.next_value::<JQuot>()?.into()),
+                "inductive" => Record::Decl(m.next_value::<JInductive>()?.into()),
+                _ => return Err(de::Error::unknown_field(k, KEYS)),
+            };
+            if rec.replace(r).is_some() {
+                return Err(de::Error::custom("more than one record on a line"));
+            }
+        }
+        let rec = rec.ok_or_else(|| de::Error::custom("no record on the line"))?;
+        match (&rec, id) {
+            (Record::Decl(_), Some(_)) => Err(de::Error::custom("a declaration has no id")),
+            (Record::Decl(_), None) | (_, Some(_)) => Ok(Line(id, rec)),
+            (_, None) => Err(de::Error::custom("missing id")),
+        }
+    }
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum JName {
-    Str { pre: u32, str: String },
-    Num { pre: u32, i: u64 },
+struct JStr {
+    pre: u32,
+    str: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum JLevel {
-    Succ(u32),
-    Max(u32, u32),
-    IMax(u32, u32),
-    Param(u32),
+struct JNum {
+    pre: u32,
+    i: u64,
+}
+
+#[derive(Deserialize)]
+struct JConst {
+    name: u32,
+    us: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct JApp {
+    #[serde(rename = "fn")]
+    fun: u32,
+    arg: u32,
 }
 
 #[derive(Deserialize)]
@@ -581,61 +717,28 @@ struct JBinding {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum JExpr {
-    Bvar(u64),
-    Sort(u32),
-    Const {
-        name: u32,
-        us: Vec<u32>,
-    },
-    App {
-        #[serde(rename = "fn")]
-        fun: u32,
-        arg: u32,
-    },
-    Lam(JBinding),
-    ForallE(JBinding),
-    LetE {
-        name: u32,
-        #[serde(rename = "type")]
-        ty: u32,
-        value: u32,
-        body: u32,
-        #[serde(default)]
-        nondep: bool,
-    },
-    NatVal(String),
-    StrVal(String),
-    #[serde(rename_all = "camelCase")]
-    Proj {
-        type_name: u32,
-        idx: u64,
-        #[serde(rename = "struct")]
-        struct_: u32,
-    },
-    Mdata {
-        expr: u32,
-    },
+struct JLet {
+    name: u32,
+    #[serde(rename = "type")]
+    ty: u32,
+    value: u32,
+    body: u32,
+    #[serde(default)]
+    nondep: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JHead {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
+struct JProj {
+    type_name: u32,
+    idx: u64,
+    #[serde(rename = "struct")]
+    struct_: u32,
 }
 
-impl From<JHead> for Head {
-    fn from(h: JHead) -> Self {
-        Self {
-            name: h.name,
-            level_params: h.level_params,
-            ty: h.ty,
-        }
-    }
+#[derive(Deserialize)]
+struct JMdata {
+    expr: u32,
 }
 
 #[derive(Deserialize)]
@@ -646,60 +749,93 @@ enum JSafety {
     Partial,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JUnsafe {
-    #[serde(flatten)]
-    head: JHead,
-    #[serde(default)]
-    is_unsafe: bool,
+/// The fields every declaration starts with, spelled out in each one since `flatten` would
+/// buffer the whole object.
+macro_rules! head {
+    ($d:ident) => {
+        Head {
+            name: $d.name,
+            level_params: $d.level_params,
+            ty: $d.ty,
+        }
+    };
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum JDecl {
-    Axiom {
-        #[serde(flatten)]
-        head: JUnsafe,
-        all: Option<Vec<u32>>,
-    },
-    Def {
-        #[serde(flatten)]
-        head: JHead,
-        value: u32,
-        hints: Hints,
-        safety: JSafety,
-        all: Vec<u32>,
-    },
-    Thm {
-        #[serde(flatten)]
-        head: JHead,
-        value: u32,
-        all: Vec<u32>,
-    },
-    Opaque {
-        #[serde(flatten)]
-        head: JUnsafe,
-        value: u32,
-        all: Option<Vec<u32>>,
-    },
-    Quot {
-        #[serde(flatten)]
-        head: JHead,
-        kind: QuotKind,
-    },
-    Inductive {
-        types: Vec<JType>,
-        ctors: Vec<JCtor>,
-        recs: Vec<JRec>,
-    },
+#[serde(rename_all = "camelCase")]
+struct JAxiom {
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    #[serde(default)]
+    is_unsafe: bool,
+    all: Option<Vec<u32>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JDef {
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    value: u32,
+    hints: Hints,
+    safety: JSafety,
+    all: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JThm {
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    value: u32,
+    all: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JOpaque {
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    value: u32,
+    #[serde(default)]
+    is_unsafe: bool,
+    all: Option<Vec<u32>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JQuot {
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    kind: QuotKind,
+}
+
+#[derive(Deserialize)]
+struct JInductive {
+    types: Vec<JType>,
+    ctors: Vec<JCtor>,
+    recs: Vec<JRec>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JType {
-    #[serde(flatten)]
-    head: JUnsafe,
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    #[serde(default)]
+    is_unsafe: bool,
     num_params: u64,
     num_indices: u64,
     all: Vec<u32>,
@@ -712,8 +848,12 @@ struct JType {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JCtor {
-    #[serde(flatten)]
-    head: JUnsafe,
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    #[serde(default)]
+    is_unsafe: bool,
     induct: u32,
     cidx: u64,
     num_params: u64,
@@ -723,8 +863,12 @@ struct JCtor {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JRec {
-    #[serde(flatten)]
-    head: JUnsafe,
+    name: u32,
+    level_params: Vec<u32>,
+    #[serde(rename = "type")]
+    ty: u32,
+    #[serde(default)]
+    is_unsafe: bool,
     all: Vec<u32>,
     num_params: u64,
     num_indices: u64,
@@ -732,34 +876,6 @@ struct JRec {
     num_minors: u64,
     rules: Vec<IndRule>,
     k: bool,
-}
-
-impl Line {
-    fn record(self) -> (Option<u32>, Record<'static>) {
-        match self {
-            Self::Name { id, name } => (
-                Some(id),
-                match name {
-                    JName::Str { pre, str } => Record::NameStr {
-                        pre,
-                        str: str.into(),
-                    },
-                    JName::Num { pre, i } => Record::NameNum { pre, i },
-                },
-            ),
-            Self::Level { il, level } => (
-                Some(il),
-                match level {
-                    JLevel::Succ(a) => Record::Succ(a),
-                    JLevel::Max(a, b) => Record::Max(a, b),
-                    JLevel::IMax(a, b) => Record::IMax(a, b),
-                    JLevel::Param(n) => Record::Param(n),
-                },
-            ),
-            Self::Expr { ie, expr } => (Some(ie), expr.into()),
-            Self::Decl(d) => (None, Record::Decl(d.into())),
-        }
-    }
 }
 
 impl From<JBinding> for Binding {
@@ -773,125 +889,107 @@ impl From<JBinding> for Binding {
     }
 }
 
-impl From<JExpr> for Record<'_> {
-    fn from(e: JExpr) -> Self {
-        match e {
-            JExpr::Bvar(i) => Self::BVar(i),
-            JExpr::Sort(l) => Self::Sort(l),
-            JExpr::Const { name, us } => Self::Const { name, us },
-            JExpr::App { fun, arg } => Self::App { fun, arg },
-            JExpr::Lam(b) => Self::Lam(b.into()),
-            JExpr::ForallE(b) => Self::Pi(b.into()),
-            JExpr::LetE {
-                name,
-                ty,
-                value,
-                body,
-                nondep,
-            } => Self::Let {
-                name,
-                ty,
-                value,
-                body,
-                nondep,
-            },
-            JExpr::NatVal(v) => Self::Nat(v.into()),
-            JExpr::StrVal(v) => Self::Str(v.into()),
-            JExpr::Proj {
-                type_name,
-                idx,
-                struct_,
-            } => Self::Proj {
-                type_name,
-                idx,
-                struct_,
-            },
-            JExpr::Mdata { expr } => Self::MData(expr),
+impl From<JAxiom> for Decl {
+    fn from(d: JAxiom) -> Self {
+        Self::Axiom {
+            is_unsafe: d.is_unsafe,
+            all: d.all,
+            head: head!(d),
         }
     }
 }
 
-impl From<JDecl> for Decl {
-    fn from(d: JDecl) -> Self {
-        match d {
-            JDecl::Axiom { head, all } => Self::Axiom {
-                head: head.head.into(),
-                is_unsafe: head.is_unsafe,
-                all,
+impl From<JDef> for Decl {
+    fn from(d: JDef) -> Self {
+        Self::Def {
+            value: d.value,
+            hints: d.hints,
+            safety: match d.safety {
+                JSafety::Safe => Safety::Safe,
+                JSafety::Unsafe => Safety::Unsafe,
+                JSafety::Partial => Safety::Partial,
             },
-            JDecl::Def {
-                head,
-                value,
-                hints,
-                safety,
-                all,
-            } => Self::Def {
-                head: head.into(),
-                value,
-                hints,
-                safety: match safety {
-                    JSafety::Safe => Safety::Safe,
-                    JSafety::Unsafe => Safety::Unsafe,
-                    JSafety::Partial => Safety::Partial,
-                },
-                all,
-            },
-            JDecl::Thm { head, value, all } => Self::Thm {
-                head: head.into(),
-                value,
-                all,
-            },
-            JDecl::Opaque { head, value, all } => Self::Opaque {
-                head: head.head.into(),
-                value,
-                is_unsafe: head.is_unsafe,
-                all,
-            },
-            JDecl::Quot { head, kind } => Self::Quot {
-                head: head.into(),
-                kind,
-            },
-            JDecl::Inductive { types, ctors, recs } => Self::Inductive {
-                types: types
-                    .into_iter()
-                    .map(|t| IndType {
-                        head: t.head.head.into(),
-                        is_unsafe: t.head.is_unsafe,
-                        num_params: t.num_params,
-                        num_indices: t.num_indices,
-                        all: t.all,
-                        ctors: t.ctors,
-                        num_nested: t.num_nested,
-                        is_rec: t.is_rec,
-                        is_reflexive: t.is_reflexive,
-                    })
-                    .collect(),
-                ctors: ctors
-                    .into_iter()
-                    .map(|c| IndCtor {
-                        head: c.head.head.into(),
-                        is_unsafe: c.head.is_unsafe,
-                        induct: c.induct,
-                        cidx: c.cidx,
-                        num_params: c.num_params,
-                        num_fields: c.num_fields,
-                    })
-                    .collect(),
-                recs: recs
-                    .into_iter()
-                    .map(|r| IndRec {
-                        head: r.head.head.into(),
-                        is_unsafe: r.head.is_unsafe,
-                        all: r.all,
-                        num_params: r.num_params,
-                        num_indices: r.num_indices,
-                        num_motives: r.num_motives,
-                        num_minors: r.num_minors,
-                        rules: r.rules,
-                        k: r.k,
-                    })
-                    .collect(),
-            },
+            all: d.all,
+            head: head!(d),
+        }
+    }
+}
+
+impl From<JThm> for Decl {
+    fn from(d: JThm) -> Self {
+        Self::Thm {
+            value: d.value,
+            all: d.all,
+            head: head!(d),
+        }
+    }
+}
+
+impl From<JOpaque> for Decl {
+    fn from(d: JOpaque) -> Self {
+        Self::Opaque {
+            value: d.value,
+            is_unsafe: d.is_unsafe,
+            all: d.all,
+            head: head!(d),
+        }
+    }
+}
+
+impl From<JQuot> for Decl {
+    fn from(d: JQuot) -> Self {
+        Self::Quot {
+            kind: d.kind,
+            head: head!(d),
+        }
+    }
+}
+
+impl From<JInductive> for Decl {
+    fn from(d: JInductive) -> Self {
+        Self::Inductive {
+            types: d
+                .types
+                .into_iter()
+                .map(|t| IndType {
+                    is_unsafe: t.is_unsafe,
+                    num_params: t.num_params,
+                    num_indices: t.num_indices,
+                    all: t.all,
+                    ctors: t.ctors,
+                    num_nested: t.num_nested,
+                    is_rec: t.is_rec,
+                    is_reflexive: t.is_reflexive,
+                    head: head!(t),
+                })
+                .collect(),
+            ctors: d
+                .ctors
+                .into_iter()
+                .map(|c| IndCtor {
+                    is_unsafe: c.is_unsafe,
+                    induct: c.induct,
+                    cidx: c.cidx,
+                    num_params: c.num_params,
+                    num_fields: c.num_fields,
+                    head: head!(c),
+                })
+                .collect(),
+            recs: d
+                .recs
+                .into_iter()
+                .map(|r| IndRec {
+                    is_unsafe: r.is_unsafe,
+                    all: r.all,
+                    num_params: r.num_params,
+                    num_indices: r.num_indices,
+                    num_motives: r.num_motives,
+                    num_minors: r.num_minors,
+                    rules: r.rules,
+                    k: r.k,
+                    head: head!(r),
+                })
+                .collect(),
         }
     }
 }

@@ -52,7 +52,7 @@ fn statement() {
     for (module, consts) in [
         ("Top", &["N.add_zero", "letty", "Even"][..]),
         ("Extra", &["greeting", "twice"]),
-        ("Pinned", &["pinned", "shadow"]),
+        ("Pinned", &["pinned", "shadow", "«fun»"]),
     ] {
         let env = Env::load_statements(search, &[module], 1, &|_, _| {}).unwrap();
         let roots: Vec<_> = consts.iter().map(|c| env.find_name(c).unwrap()).collect();

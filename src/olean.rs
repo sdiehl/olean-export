@@ -265,14 +265,27 @@ impl Image {
             return Ok((o >> 1).to_string());
         }
         self.expect(o, MPZ, "a Nat")?;
-        if !self.header.gmp {
-            return Err(corrupt("big Nat literals need a Lean built with GMP"));
+        // GMP's `__mpz_struct` has an `i32` size and 64-bit limbs; without GMP, Lean's own
+        // `mpz` has a `bool` sign, a `size_t` size and 32-bit digits. Either way the compactor
+        // puts the digits right after the object, so the stored pointer must say so.
+        let (at, len) = if self.header.gmp {
+            let b = self.bytes(o + 12, 4)?;
+            (
+                o + 24,
+                8 * i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs() as usize,
+            )
+        } else {
+            let n = usize::try_from(self.u64(o + 16)?).map_err(|_| corrupt("Nat too large"))?;
+            (o + 32, 4 * n)
+        };
+        if self.u64(at - 8)? != at {
+            return Err(corrupt(format!("Nat at {o:#x} does not hold its digits")));
         }
-        let b = self.bytes(o + 12, 4)?;
-        let size = u64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs());
-        let mut digits = (0..size)
-            .map(|i| self.u64(o + 24 + 8 * i))
-            .collect::<Result<Vec<_>>>()?;
+        let mut digits = self
+            .bytes(at, len)?
+            .chunks(8)
+            .map(|c| c.iter().rev().fold(0, |v, &b| v << 8 | u64::from(b)))
+            .collect();
         Ok(decimal(&mut digits))
     }
 }
