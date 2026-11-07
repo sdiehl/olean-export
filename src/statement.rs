@@ -105,7 +105,7 @@ pub fn report(
             e.insert(ranges(&resolve(search, module)?)?);
         }
         let file = format!("{}.lean", module.replace('.', "/"));
-        let at = match lines[&m].get(&env.dotted(c)) {
+        let at = match lines[&m].get(&env.display(c)) {
             Some((a, b)) if a == b => format!("{file}:{a}"),
             Some((a, b)) => format!("{file}:{a}-{b}"),
             None => file,
@@ -127,7 +127,7 @@ fn ranges(path: &Path) -> Result<FxHashMap<String, (u64, u64)>> {
             let range = img.field(img.field(d, 1)?, 0)?;
             let line = |pos| img.field(pos, 0).and_then(small_nat);
             let span = (line(img.field(range, 0)?)?, line(img.field(range, 2)?)?);
-            out.insert(img.str_name(img.field(d, 0)?)?, span);
+            out.insert(img.display_name(img.field(d, 0)?)?, span);
         }
     }
     Ok(out)
@@ -234,7 +234,7 @@ impl<'e> Printer<'e> {
         let ps: Vec<String> = k
             .level_params
             .iter()
-            .map(|&n| self.env.display(n))
+            .map(|&n| universe(self.env, n))
             .collect();
         let us = if ps.is_empty() {
             String::new()
@@ -404,8 +404,8 @@ impl<'e> Printer<'e> {
         let plus = || Step::Text(format!(" + {n}").into());
         match env.levels[base] {
             Level::Zero => write!(self.out, "{n}").expect("string"),
-            Level::Param(p) if n == 0 => self.out.push_str(&env.display(p)),
-            Level::Param(p) => emit(todo, arg, [Step::Text(env.display(p).into()), plus()]),
+            Level::Param(p) if n == 0 => self.out.push_str(&universe(env, p)),
+            Level::Param(p) => emit(todo, arg, [Step::Text(universe(env, p).into()), plus()]),
             Level::Max(a, b) | Level::IMax(a, b) => {
                 let word = if matches!(env.levels[base], Level::Max(..)) {
                     "max "
@@ -506,6 +506,16 @@ impl<'e> Printer<'e> {
             i += 1;
         }
         escape(&x).into_owned()
+    }
+}
+
+/// A universe parameter's name, escaped also where universe syntax reads it as a word.
+fn universe(env: &Env, p: NameId) -> String {
+    let s = env.display(p);
+    if matches!(s.as_str(), "max" | "imax") {
+        format!("«{s}»")
+    } else {
+        s
     }
 }
 

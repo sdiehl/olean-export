@@ -50,13 +50,17 @@ pub struct Env {
     live: Option<Box<Live>>,
 }
 
-/// Identifier-shaped tokens of Lean's term syntax, which a name must not print as.
+/// Identifier-shaped tokens of Lean's term and command syntax, which a name must not print
+/// as. Universe syntax adds `max` and `imax`, which the statement printer escapes itself.
+#[rustfmt::skip]
 const KEYWORDS: &[&str] = &[
-    "Prop", "Sort", "Type", "at", "by", "calc", "do", "else", "end", "forall", "from", "fun",
-    "have", "if", "in", "let", "match", "nofun", "nomatch", "open", "show", "sorry", "suffices",
-    "then", "this", "where", "with",
+    "Prop", "Sort", "Type", "abbrev", "at", "attribute", "axiom", "by", "calc", "class", "def",
+    "deriving", "do", "else", "end", "example", "export", "forall", "from", "fun", "have", "if",
+    "import", "in", "inductive", "instance", "let", "local", "macro", "match", "mutual",
+    "namespace", "noncomputable", "nofun", "nomatch", "opaque", "open", "partial", "private",
+    "protected", "scoped", "section", "set_option", "show", "sorry", "structure", "suffices",
+    "syntax", "then", "theorem", "this", "universe", "unsafe", "variable", "where", "with",
 ];
-
 /// A name component in `«»` unless Lean would read it back as itself unescaped. Lean has no
 /// way to write a `»` in a name, so `»` and `\` are written after a `\`, which no name Lean
 /// can print contains.

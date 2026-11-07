@@ -268,16 +268,17 @@ impl Image {
         // GMP's `__mpz_struct` has an `i32` size and 64-bit limbs; without GMP, Lean's own
         // `mpz` has a `bool` sign, a `size_t` size and 32-bit digits. Either way the compactor
         // puts the digits right after the object, so the stored pointer must say so.
-        let (at, len) = if self.header.gmp {
+        let (at, n, width) = if self.header.gmp {
             let b = self.bytes(o + 12, 4)?;
-            (
-                o + 24,
-                8 * i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs() as usize,
-            )
+            let n = i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs();
+            (o + 24, u64::from(n), 8)
         } else {
-            let n = usize::try_from(self.u64(o + 16)?).map_err(|_| corrupt("Nat too large"))?;
-            (o + 32, 4 * n)
+            (o + 32, self.u64(o + 16)?, 4)
         };
+        let len = n
+            .checked_mul(width)
+            .and_then(|l| usize::try_from(l).ok())
+            .ok_or_else(|| corrupt(format!("Nat at {o:#x} is too large")))?;
         if self.u64(at - 8)? != at {
             return Err(corrupt(format!("Nat at {o:#x} does not hold its digits")));
         }

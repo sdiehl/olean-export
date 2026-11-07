@@ -593,7 +593,7 @@ impl<'de> Visitor<'de> for LineVisitor {
         while let Some(k) = m.next_key::<&str>()? {
             let r = match k {
                 "in" | "il" | "ie" => {
-                    id = Some(m.next_value()?);
+                    id = Some((k, m.next_value()?));
                     continue;
                 }
                 "str" => {
@@ -660,12 +660,10 @@ impl<'de> Visitor<'de> for LineVisitor {
                     }
                 }
                 "mdata" => Record::MData(m.next_value::<JMdata>()?.expr),
-                "axiom" => Record::Decl(m.next_value::<JAxiom>()?.into()),
-                "def" => Record::Decl(m.next_value::<JDef>()?.into()),
-                "thm" => Record::Decl(m.next_value::<JThm>()?.into()),
-                "opaque" => Record::Decl(m.next_value::<JOpaque>()?.into()),
-                "quot" => Record::Decl(m.next_value::<JQuot>()?.into()),
-                "inductive" => Record::Decl(m.next_value::<JInductive>()?.into()),
+                "axiom" | "def" | "thm" | "opaque" | "quot" => {
+                    Record::Decl(m.next_value::<JDecl>()?.decl(k)?)
+                }
+                "inductive" => Record::Decl(m.next_value::<JInductive>()?.decl()?),
                 _ => return Err(de::Error::unknown_field(k, KEYS)),
             };
             if rec.replace(r).is_some() {
@@ -673,10 +671,18 @@ impl<'de> Visitor<'de> for LineVisitor {
             }
         }
         let rec = rec.ok_or_else(|| de::Error::custom("no record on the line"))?;
-        match (&rec, id) {
-            (Record::Decl(_), Some(_)) => Err(de::Error::custom("a declaration has no id")),
-            (Record::Decl(_), None) | (_, Some(_)) => Ok(Line(id, rec)),
-            (_, None) => Err(de::Error::custom("missing id")),
+        let want = match rec {
+            Record::Decl(_) => None,
+            Record::NameStr { .. } | Record::NameNum { .. } => Some("in"),
+            Record::Succ(_) | Record::Max(..) | Record::IMax(..) | Record::Param(_) => Some("il"),
+            _ => Some("ie"),
+        };
+        match (want, id) {
+            (None, None) => Ok(Line(None, rec)),
+            (Some(w), Some((k, i))) if w == k => Ok(Line(Some(i), rec)),
+            (Some(w), Some((k, _))) => Err(de::Error::custom(format!("`{k}` where `{w}` belongs"))),
+            (Some(w), None) => Err(de::Error::custom(format!("missing `{w}`"))),
+            (None, Some((k, _))) => Err(de::Error::custom(format!("a declaration has no `{k}`"))),
         }
     }
 }
@@ -749,133 +755,159 @@ enum JSafety {
     Partial,
 }
 
-/// The fields every declaration starts with, spelled out in each one since `flatten` would
-/// buffer the whole object.
-macro_rules! head {
-    ($d:ident) => {
-        Head {
-            name: $d.name,
-            level_params: $d.level_params,
-            ty: $d.ty,
-        }
-    };
-}
-
+/// Any constant of a declaration line: the fields they all share, and every other field as
+/// optional, so that one plain struct reads them all without `flatten`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JAxiom {
+struct JDecl {
     name: u32,
     level_params: Vec<u32>,
     #[serde(rename = "type")]
     ty: u32,
     #[serde(default)]
     is_unsafe: bool,
+    value: Option<u32>,
+    hints: Option<Hints>,
+    safety: Option<JSafety>,
     all: Option<Vec<u32>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JDef {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    value: u32,
-    hints: Hints,
-    safety: JSafety,
-    all: Vec<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JThm {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    value: u32,
-    all: Vec<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JOpaque {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    value: u32,
-    #[serde(default)]
-    is_unsafe: bool,
-    all: Option<Vec<u32>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JQuot {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    kind: QuotKind,
+    kind: Option<QuotKind>,
+    num_params: Option<u64>,
+    num_indices: Option<u64>,
+    ctors: Option<Vec<u32>>,
+    num_nested: Option<u64>,
+    is_rec: Option<bool>,
+    is_reflexive: Option<bool>,
+    induct: Option<u32>,
+    cidx: Option<u64>,
+    num_fields: Option<u64>,
+    num_motives: Option<u64>,
+    num_minors: Option<u64>,
+    rules: Option<Vec<IndRule>>,
+    k: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct JInductive {
-    types: Vec<JType>,
-    ctors: Vec<JCtor>,
-    recs: Vec<JRec>,
+    types: Vec<JDecl>,
+    ctors: Vec<JDecl>,
+    recs: Vec<JDecl>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JType {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    #[serde(default)]
-    is_unsafe: bool,
-    num_params: u64,
-    num_indices: u64,
-    all: Vec<u32>,
-    ctors: Vec<u32>,
-    num_nested: u64,
-    is_rec: bool,
-    is_reflexive: bool,
+/// The field `$f` of a declaration, which its kind requires.
+macro_rules! need {
+    ($d:ident . $f:ident, $json:literal) => {
+        $d.$f
+            .take()
+            .ok_or_else(|| de::Error::custom(concat!("missing field `", $json, "`")))?
+    };
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JCtor {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    #[serde(default)]
-    is_unsafe: bool,
-    induct: u32,
-    cidx: u64,
-    num_params: u64,
-    num_fields: u64,
+impl JDecl {
+    fn head(self) -> Head {
+        Head {
+            name: self.name,
+            level_params: self.level_params,
+            ty: self.ty,
+        }
+    }
+
+    /// The declaration a line keyed `kind` holds.
+    fn decl<E: de::Error>(mut self, kind: &str) -> std::result::Result<Decl, E> {
+        Ok(match kind {
+            "axiom" => Decl::Axiom {
+                is_unsafe: self.is_unsafe,
+                all: self.all.take(),
+                head: self.head(),
+            },
+            "def" => Decl::Def {
+                value: need!(self.value, "value"),
+                hints: need!(self.hints, "hints"),
+                safety: match need!(self.safety, "safety") {
+                    JSafety::Safe => Safety::Safe,
+                    JSafety::Unsafe => Safety::Unsafe,
+                    JSafety::Partial => Safety::Partial,
+                },
+                all: need!(self.all, "all"),
+                head: self.head(),
+            },
+            "thm" => Decl::Thm {
+                value: need!(self.value, "value"),
+                all: need!(self.all, "all"),
+                head: self.head(),
+            },
+            "opaque" => Decl::Opaque {
+                value: need!(self.value, "value"),
+                is_unsafe: self.is_unsafe,
+                all: self.all.take(),
+                head: self.head(),
+            },
+            _ => Decl::Quot {
+                kind: need!(self.kind, "kind"),
+                head: self.head(),
+            },
+        })
+    }
+
+    fn ind_type<E: de::Error>(mut self) -> std::result::Result<IndType, E> {
+        Ok(IndType {
+            is_unsafe: self.is_unsafe,
+            num_params: need!(self.num_params, "numParams"),
+            num_indices: need!(self.num_indices, "numIndices"),
+            all: need!(self.all, "all"),
+            ctors: need!(self.ctors, "ctors"),
+            num_nested: need!(self.num_nested, "numNested"),
+            is_rec: need!(self.is_rec, "isRec"),
+            is_reflexive: need!(self.is_reflexive, "isReflexive"),
+            head: self.head(),
+        })
+    }
+
+    fn ind_ctor<E: de::Error>(mut self) -> std::result::Result<IndCtor, E> {
+        Ok(IndCtor {
+            is_unsafe: self.is_unsafe,
+            induct: need!(self.induct, "induct"),
+            cidx: need!(self.cidx, "cidx"),
+            num_params: need!(self.num_params, "numParams"),
+            num_fields: need!(self.num_fields, "numFields"),
+            head: self.head(),
+        })
+    }
+
+    fn ind_rec<E: de::Error>(mut self) -> std::result::Result<IndRec, E> {
+        Ok(IndRec {
+            is_unsafe: self.is_unsafe,
+            all: need!(self.all, "all"),
+            num_params: need!(self.num_params, "numParams"),
+            num_indices: need!(self.num_indices, "numIndices"),
+            num_motives: need!(self.num_motives, "numMotives"),
+            num_minors: need!(self.num_minors, "numMinors"),
+            rules: need!(self.rules, "rules"),
+            k: need!(self.k, "k"),
+            head: self.head(),
+        })
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct JRec {
-    name: u32,
-    level_params: Vec<u32>,
-    #[serde(rename = "type")]
-    ty: u32,
-    #[serde(default)]
-    is_unsafe: bool,
-    all: Vec<u32>,
-    num_params: u64,
-    num_indices: u64,
-    num_motives: u64,
-    num_minors: u64,
-    rules: Vec<IndRule>,
-    k: bool,
+impl JInductive {
+    fn decl<E: de::Error>(self) -> std::result::Result<Decl, E> {
+        Ok(Decl::Inductive {
+            types: self
+                .types
+                .into_iter()
+                .map(JDecl::ind_type)
+                .collect::<Result<_, E>>()?,
+            ctors: self
+                .ctors
+                .into_iter()
+                .map(JDecl::ind_ctor)
+                .collect::<Result<_, E>>()?,
+            recs: self
+                .recs
+                .into_iter()
+                .map(JDecl::ind_rec)
+                .collect::<Result<_, E>>()?,
+        })
+    }
 }
 
 impl From<JBinding> for Binding {
@@ -885,111 +917,6 @@ impl From<JBinding> for Binding {
             name: b.name,
             ty: b.ty,
             body: b.body,
-        }
-    }
-}
-
-impl From<JAxiom> for Decl {
-    fn from(d: JAxiom) -> Self {
-        Self::Axiom {
-            is_unsafe: d.is_unsafe,
-            all: d.all,
-            head: head!(d),
-        }
-    }
-}
-
-impl From<JDef> for Decl {
-    fn from(d: JDef) -> Self {
-        Self::Def {
-            value: d.value,
-            hints: d.hints,
-            safety: match d.safety {
-                JSafety::Safe => Safety::Safe,
-                JSafety::Unsafe => Safety::Unsafe,
-                JSafety::Partial => Safety::Partial,
-            },
-            all: d.all,
-            head: head!(d),
-        }
-    }
-}
-
-impl From<JThm> for Decl {
-    fn from(d: JThm) -> Self {
-        Self::Thm {
-            value: d.value,
-            all: d.all,
-            head: head!(d),
-        }
-    }
-}
-
-impl From<JOpaque> for Decl {
-    fn from(d: JOpaque) -> Self {
-        Self::Opaque {
-            value: d.value,
-            is_unsafe: d.is_unsafe,
-            all: d.all,
-            head: head!(d),
-        }
-    }
-}
-
-impl From<JQuot> for Decl {
-    fn from(d: JQuot) -> Self {
-        Self::Quot {
-            kind: d.kind,
-            head: head!(d),
-        }
-    }
-}
-
-impl From<JInductive> for Decl {
-    fn from(d: JInductive) -> Self {
-        Self::Inductive {
-            types: d
-                .types
-                .into_iter()
-                .map(|t| IndType {
-                    is_unsafe: t.is_unsafe,
-                    num_params: t.num_params,
-                    num_indices: t.num_indices,
-                    all: t.all,
-                    ctors: t.ctors,
-                    num_nested: t.num_nested,
-                    is_rec: t.is_rec,
-                    is_reflexive: t.is_reflexive,
-                    head: head!(t),
-                })
-                .collect(),
-            ctors: d
-                .ctors
-                .into_iter()
-                .map(|c| IndCtor {
-                    is_unsafe: c.is_unsafe,
-                    induct: c.induct,
-                    cidx: c.cidx,
-                    num_params: c.num_params,
-                    num_fields: c.num_fields,
-                    head: head!(c),
-                })
-                .collect(),
-            recs: d
-                .recs
-                .into_iter()
-                .map(|r| IndRec {
-                    is_unsafe: r.is_unsafe,
-                    all: r.all,
-                    num_params: r.num_params,
-                    num_indices: r.num_indices,
-                    num_motives: r.num_motives,
-                    num_minors: r.num_minors,
-                    rules: r.rules,
-                    k: r.k,
-                    head: head!(r),
-                })
-                .collect(),
         }
     }
 }

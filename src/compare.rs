@@ -7,6 +7,7 @@
 
 use crate::{
     blean,
+    env::escape,
     error::{corrupt, Result},
     ndjson,
     record::{Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Sink, Table},
@@ -89,7 +90,7 @@ impl Canon {
             _ => format!("{}.{s}", self.name(p)),
         };
         match self.get(n) {
-            Key::NameStr(p, s) => join(p, &s),
+            Key::NameStr(p, s) => join(p, &escape(&s)),
             Key::NameNum(p, i) => join(p, &i.to_string()),
             _ => String::new(),
         }

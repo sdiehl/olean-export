@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-- Names print with `«»` where Lean needs it, and `-c` reads them back. `statement` renames binders that would shadow a constant or print as a keyword.
-- `statement` names every axiom but only counts theorems from `--trust`ed modules.
+- Escape names with `«»` where Lean needs it, and accept them in `-c`.
+- `statement` counts trusted theorems instead of listing them.
 - Read big Nat literals from Lean builds without GMP.
-- The NDJSON reader parses each line in one pass, with clearer errors, about 30% faster.
-- `just kernel` checks each fixture's statement cone with a kernel.
+- NDJSON reading is 30% faster and checks id keys.
+- CI type-checks the statement cones with nano-lean.
 
 ## 0.5.0 (2026-11-07)
 

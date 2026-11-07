@@ -46,3 +46,22 @@ jobs:
 
       - name: Export fixtures with the CLI
         run: ./target/release/olean-export Top -L tests/cases/build -o top.ndjson
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Cache nl-fast
+        id: nl-fast
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/nl-fast
+          key: nl-fast-54ce971
+
+      - name: Build nl-fast
+        if: steps.nl-fast.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/sdiehl/nano-lean --rev 54ce971 --bin nl-fast nano-lean
+
+      - name: Check statement cones with a kernel
+        run: just kernel

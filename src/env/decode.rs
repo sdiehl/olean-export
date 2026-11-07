@@ -1,4 +1,5 @@
 use super::{
+    escape,
     reload::Live,
     table::Tables,
     term::{
@@ -82,11 +83,25 @@ impl Image {
             .collect()
     }
 
-    pub(crate) fn str_name(&self, mut o: u64) -> Result<String> {
+    pub(crate) fn str_name(&self, o: u64) -> Result<String> {
+        self.join_name(o, false)
+    }
+
+    /// The name at `o` as [`Env::display`] writes it.
+    pub(crate) fn display_name(&self, o: u64) -> Result<String> {
+        self.join_name(o, true)
+    }
+
+    fn join_name(&self, mut o: u64, escaped: bool) -> Result<String> {
         let mut parts = Vec::new();
         while !is_scalar(o) && self.tag(o)? != 0 {
             parts.push(if self.tag(o)? == 1 {
-                self.str(self.field(o, 1)?)?.to_owned()
+                let s = self.str(self.field(o, 1)?)?;
+                if escaped {
+                    escape(s).into_owned()
+                } else {
+                    s.to_owned()
+                }
             } else {
                 self.nat_decimal(self.field(o, 1)?)?
             });
