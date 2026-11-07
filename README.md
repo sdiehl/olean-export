@@ -107,21 +107,11 @@ $ olean-export compare want.ndjson got.blean
 
 ## Statement
 
-`statement` prints what a theorem's statement rests on, with every proof left out: the definitions, inductives, opaques and axioms its type reaches, and through them the bodies of definitions. `--trust` hides what given modules (or their submodules) define, so a reviewer reads only the rest. Each declaration carries its source lines.
-
-Terms print raw, in Lean syntax with every implicit argument and universe spelled out. Notation, coercions and macros never reach an olean, so nothing can hide behind them.
+`statement` prints every definition, structure and axiom a theorem's statement rests on, as raw terms with source lines and no proofs, so you can review the trusted base of, say, a Tau Ceti theorem without reading all of Tau Ceti. `--trust` hides what you already believe, and `-f ndjson` exports the cone for a checker.
 
 ```bash
-$ olean-export statement Mathlib -c Real.pi_gt_three --trust Init,Std,Lean
--- Real.pi_gt_three rests on 599 declarations in 80 modules, and 382 more in Init, Std, Lean
--- axioms: Classical.choice
-
--- Mathlib/Analysis/Real/Pi/Bounds.lean:151-153
-theorem Real.pi_gt_three : LT.lt.{0} Real Real.instLT (OfNat.ofNat.{0} Real 3 ...) Real.pi
-...
+$ olean-export statement FLT -c THEOREM --trust Init,Std,Lean,Mathlib
 ```
-
-`-f ndjson` or `-f blean` writes the cone itself, with each theorem an axiom over its type, for a checker to confirm the statement is well formed. On all of Mathlib this takes 4s.
 
 ## License
 

@@ -1,14 +1,11 @@
 # Changelog
 
-## Unreleased
-
-- Add `statement`, which prints what a theorem's statement rests on without proofs, with `--trust` to hide trusted modules, or exports that cone (`Env::statement`, `Exporter::statements`).
-- `compare` parses NDJSON in parallel and reads both inputs at once: 48s instead of 176s on Mathlib.
-
 ## 0.5.0 (2026-11-07)
 
 - Add `compare`, which diffs two exports, NDJSON or blean, up to ids, order and binders.
 - `-c` leaves theorem values outside the cone undecoded (`Env::load_cone`). `Kind::Thm` now holds a `Theorem` with an optional value.
+- Add `statement`, which prints what a theorem's statement rests on, without proofs, minus `--trust`ed modules.
+- `compare` parses in parallel: 48s instead of 176s on Mathlib.
 - Add `--rss` to show peak memory.
 - Test the fixtures and a cone against lean4export output.
 
