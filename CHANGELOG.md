@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-11-07)
 
-- Add `compare` subcommand and `olean_export::compare`, which diff two exports, NDJSON or blean, up to id numbering, record order and binders.
-- `-c` decodes only the theorem values its constants reach, through the new `Env::load_cone`. `Kind::Thm` now holds a `Theorem`, whose value is an `Option`.
-- Add `--rss` to show peak resident memory in the progress bars and summary.
-- Test every fixture, and one constant subset, against checked-in lean4export output.
+- Add `compare`, which diffs two exports, NDJSON or blean, up to ids, order and binders.
+- `-c` leaves theorem values outside the cone undecoded (`Env::load_cone`). `Kind::Thm` now holds a `Theorem` with an optional value.
+- Add `--rss` to show peak memory.
+- Test the fixtures and a cone against lean4export output.
 
 ## 0.4.0 (2026-10-29)
 

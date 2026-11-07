@@ -57,17 +57,21 @@ Modules decode in parallel on every core, and `-j N` sets the thread count. The 
 
 Wall time:
 
-| Target                    | lean4export | olean-export | Speedup |
-| ------------------------- | ----------- | ------------ | ------- |
-| Small model on `Lean`     | 18.3s       | 1.0s         | 18x     |
-| Mathlib-dependent library | 1541s       | 15s          | 100x    |
+| Target                     | lean4export | olean-export | Speedup |
+| -------------------------- | ----------- | ------------ | ------- |
+| Small model on `Lean`      | 18.3s       | 1.0s         | 18x     |
+| All of Mathlib             | 1526s       | 18s          | 85x     |
+| One Mathlib theorem (`-c`) | 16.5s       | 5.3s         | 3x      |
 
 Peak memory:
 
-| Target                    | lean4export | olean-export |
-| ------------------------- | ----------- | ------------ |
-| Small model on `Lean`     | 1.3 GB      | 0.5 GB       |
-| Mathlib-dependent library | 9.4 GB      | 4.2 GB       |
+| Target                     | lean4export | olean-export |
+| -------------------------- | ----------- | ------------ |
+| Small model on `Lean`      | 1.3 GB      | 0.5 GB       |
+| All of Mathlib             | 9.4 GB      | 4.3 GB       |
+| One Mathlib theorem (`-c`) | 5.6 GB      | 2.0 GB       |
+
+Mathlib is on Lean 4.35.0 (712,205 declarations, identical under `compare`), and the theorem is `Fin.insertNth_apply_succAbove`.
 
 ## Inspect
 
