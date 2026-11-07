@@ -43,7 +43,7 @@ fn damaged() {
     insta::assert_snapshot!(out);
 }
 
-/// The statement report, and the same cone exported with its theorem as an axiom.
+/// The statement report, and the cone of its first root exported with theorems as axioms.
 #[test]
 fn statement() {
     let build = build();
@@ -52,6 +52,7 @@ fn statement() {
     for (module, consts) in [
         ("Top", &["N.add_zero", "letty", "Even"][..]),
         ("Extra", &["greeting", "twice"]),
+        ("Pinned", &["pinned", "shadow"]),
     ] {
         let env = Env::load_statements(search, &[module], 1, &|_, _| {}).unwrap();
         let roots: Vec<_> = consts.iter().map(|c| env.find_name(c).unwrap()).collect();
@@ -59,9 +60,11 @@ fn statement() {
         olean_export::statement::report(&env, search, &roots, &["Init".into()], 0, &mut text)
             .unwrap();
         writeln!(out, "{}", String::from_utf8(text).unwrap()).unwrap();
-        if module == "Top" {
+        if module != "Extra" {
             let mut ex = Exporter::new(&env, Vec::new()).statements();
-            ex.constant(roots[0]).unwrap();
+            for (_, c) in env.statement(&roots[..1]).unwrap() {
+                ex.constant(c).unwrap();
+            }
             let ndjson = String::from_utf8(ex.finish().unwrap()).unwrap();
             let kinds = ndjson.lines().filter_map(|l| {
                 ["axiom", "def", "thm", "inductive"]

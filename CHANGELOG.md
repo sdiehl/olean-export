@@ -8,6 +8,9 @@
 - `compare` parses in parallel: 48s instead of 176s on Mathlib.
 - Add `--rss` to show peak memory.
 - Test the fixtures and a cone against lean4export output.
+- `Sink::record` takes the id each record defines, so a resumed NDJSON export continues its ids. `Error::Misuse` reports API misuse.
+- Fix `Exporter::update` missing changed private constants, NDJSON escapes that differed from Lean's, unchecked ids in `compare`, and broken pipes reported as errors.
+- Refuse `.olean.server` and `.olean.private` parts from a different Lean build than their `.olean`.
 
 ## 0.4.0 (2026-10-29)
 

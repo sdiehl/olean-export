@@ -4,6 +4,7 @@ expression: out
 ---
 -- N.add_zero, letty, Even rests on 4 declarations in 2 modules, and 0 more in Init
 -- axioms: none
+-- theorems taken as stated: none
 
 -- Base.lean:28-29
 theorem N.add_zero : ∀ (m : N), Eq.{1} N (N.add m N.zero) m
@@ -37,6 +38,7 @@ inductive Odd : N → Prop
 exported: inductive, inductive, def, axiom
 -- greeting, twice rests on 3 declarations in 1 module, and 0 more in Init
 -- axioms: none
+-- theorems taken as stated: none
 
 -- Extra.lean:51
 def greeting : String :=
@@ -58,3 +60,37 @@ def Nat.add : Nat → Nat → Nat :=
 inductive Nat : Type
 | Nat.zero : Nat
 | Nat.succ : Nat → Nat
+
+-- pinned, shadow rests on 5 declarations in 2 modules, and 0 more in Init
+-- axioms: none
+-- theorems taken as stated: N.add_zero
+
+-- Pinned.lean:10
+def pinned : Pinned :=
+  Pinned.mk N.zero (N.add_zero N.zero)
+
+-- Pinned.lean:12
+def shadow : ∀ (N_1 : Type) (x : N_1), N_1 :=
+  fun (N_1 : Type) (x : N_1) => x
+
+-- Base.lean:12-13
+inductive Eq.{u} : ∀ {α : Sort u} (a : α), α → Prop
+| Eq.refl.{u} : ∀ {α : Sort u} (a : α), Eq.{u} α a a
+
+-- Base.lean:21-23
+inductive N : Type
+| N.zero : N
+| N.succ : N → N
+
+-- Base.lean:28-29
+theorem N.add_zero : ∀ (m : N), Eq.{1} N (N.add m N.zero) m
+
+-- Base.lean:25-26
+def N.add : N → N → N :=
+  fun (m : N) (n : N) => N.rec.{1} (fun (x : N) => N) m (fun (x : N) (ih : N) => N.succ ih) n
+
+-- Pinned.lean:6-8
+inductive Pinned : Type
+| Pinned.mk : ∀ (n : N), Eq.{1} N (N.add n N.zero) n → Pinned
+
+exported: inductive, inductive, def, axiom, inductive, def

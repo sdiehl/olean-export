@@ -47,7 +47,7 @@ struct Cli {
     #[arg(short = 'L', long = "search", value_name = "DIR", global = true)]
     search: Vec<PathBuf>,
     /// Decode modules on N threads [default: all cores]
-    #[arg(short, long, value_name = "N")]
+    #[arg(short, long, value_name = "N", global = true)]
     jobs: Option<usize>,
     /// Output format
     #[arg(short, long, value_enum, default_value_t = Format::Ndjson)]
@@ -325,9 +325,7 @@ fn run(cli: &Cli) -> Res {
         None,
         "{spinner:.cyan} decoding [{elapsed}] {msg}",
     );
-    let jobs = cli
-        .jobs
-        .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from));
+    let jobs = jobs(cli);
     pb.set_message(format!("finding modules, {jobs} threads"));
     let tick = |modules: usize, consts: usize| {
         pb.set_message(format!(
@@ -426,6 +424,11 @@ fn export<S: Sink>(
     Ok(counts)
 }
 
+fn jobs(cli: &Cli) -> usize {
+    cli.jobs
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, usize::from))
+}
+
 fn statement(
     cli: &Cli,
     modules: &[String],
@@ -437,8 +440,7 @@ fn statement(
 ) -> Res {
     let search = search(cli)?;
     let roots: Vec<&str> = modules.iter().map(String::as_str).collect();
-    let jobs = thread::available_parallelism().map_or(1, usize::from);
-    let env = Env::load_statements(&search, &roots, jobs, &|_, _| {})?;
+    let env = Env::load_statements(&search, &roots, jobs(cli), &|_, _| {})?;
     let targets = consts
         .iter()
         .map(|n| {
@@ -452,28 +454,25 @@ fn statement(
     };
     let mut out = BufWriter::with_capacity(1 << 20, sink);
     match format {
-        Shape::Text => thread::scope(|s| {
-            // terms print recursively, and some are deep
-            thread::Builder::new()
-                .stack_size(1 << 30)
-                .spawn_scoped(s, || {
-                    statement::report(&env, &search, &targets, trust, max, &mut out)
-                })?
-                .join()
-                .expect("printer panicked")
-        })?,
-        Shape::Ndjson => export(
-            Exporter::new(&env, out.by_ref()).statements(),
-            &targets,
-            |_| {},
-        )
-        .map(drop)?,
-        Shape::Blean => export(
-            Exporter::with_sink(&env, Blean::new(out.by_ref())).statements(),
-            &targets,
-            |_| {},
-        )
-        .map(drop)?,
+        Shape::Text => statement::report(&env, &search, &targets, trust, max, &mut out)?,
+        // exactly what the text report lists, which already includes everything it rests on
+        Shape::Ndjson | Shape::Blean => {
+            let cone: Vec<NameId> = env
+                .statement(&targets)?
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect();
+            if format == Shape::Ndjson {
+                export(
+                    Exporter::new(&env, out.by_ref()).statements(),
+                    &cone,
+                    |_| {},
+                )?;
+            } else {
+                let sink = Blean::new(out.by_ref());
+                export(Exporter::with_sink(&env, sink).statements(), &cone, |_| {})?;
+            }
+        }
     }
     out.flush()?;
     Ok(())

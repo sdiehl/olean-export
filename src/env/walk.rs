@@ -4,7 +4,7 @@ use super::{
 };
 use crate::error::{corrupt, Error, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::{iter, mem, path::PathBuf};
+use std::{mem, path::PathBuf};
 
 /// Constants the kernel relies on without a term naming them: `Nat` for numeric literals,
 /// what string literals unfold to, and `Eq` with the quotient constants.
@@ -33,8 +33,6 @@ pub(crate) enum Depth {
     Full,
     /// Theorems as axioms over their types, as [`crate::Exporter::statements`] writes them.
     Statements,
-    /// What a statement means: no theorems at all and no opaque values.
-    Meaning,
 }
 
 /// Something a constant or term mentions.
@@ -125,6 +123,7 @@ impl Env {
                 .map(|n| (pending[&n], n))
                 .collect();
             if due.is_empty() {
+                env.live = Some(live);
                 return Ok(env);
             }
             due.sort_unstable_by_key(|&(p, _)| p);
@@ -154,16 +153,19 @@ impl Env {
 
     /// What the statements of `consts` rest on, with the index of each one's module, in
     /// load order: everything their types mention, and through it the values of
-    /// definitions and whole inductive families, but no proof. Theorems reached inside
-    /// definitions count by name only, since any proof of them would do.
+    /// definitions and whole inductive families, but no proof. A theorem reached inside a
+    /// definition is taken as stated, as [`crate::Exporter::statements`] writes it.
     pub fn statement(&self, consts: &[NameId]) -> Result<Vec<(usize, NameId)>> {
-        let mut w = Walk::new(Depth::Meaning);
+        let mut w = Walk::new(Depth::Statements);
         let todo = consts
             .iter()
-            .flat_map(|c| {
-                iter::once(Dep::Const(*c)).chain(self.consts.get(c).map(|k| Dep::Expr(k.ty)))
+            .map(|&c| {
+                self.consts
+                    .contains_key(&c)
+                    .then_some(Dep::Const(c))
+                    .ok_or_else(|| Error::UnknownConstant(self.display(c)))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         self.walk(&mut w, todo)?;
         let mut module = 0;
         Ok(self
@@ -237,10 +239,8 @@ impl Env {
     ) -> Result<()> {
         let mut ty = || f(Dep::Expr(k.ty));
         match &k.kind {
-            Kind::Thm(_) if depth == Depth::Meaning => {}
             Kind::Axiom => ty(),
             Kind::Thm(_) if depth == Depth::Statements => ty(),
-            Kind::Opaque(_) if depth == Depth::Meaning => ty(),
             Kind::Defn(Defn { value, .. }) | Kind::Opaque(Body { value, .. }) => {
                 ty();
                 f(Dep::Expr(*value));
