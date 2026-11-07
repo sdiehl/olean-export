@@ -20,6 +20,7 @@ mod inspect;
 pub mod ndjson;
 mod olean;
 pub mod record;
+pub mod statement;
 
 pub use compare::{compare, Diff};
 pub use env::{

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add `statement`, which prints what a theorem's statement rests on without proofs, with `--trust` to hide trusted modules, or exports that cone (`Env::statement`, `Exporter::statements`).
+- `compare` parses NDJSON in parallel and reads both inputs at once: 48s instead of 176s on Mathlib.
+
 ## 0.5.0 (2026-11-07)
 
 - Add `compare`, which diffs two exports, NDJSON or blean, up to ids, order and binders.

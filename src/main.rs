@@ -66,6 +66,14 @@ enum Format {
     Blean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Shape {
+    /// Each declaration as a raw term, with its source lines
+    Text,
+    Ndjson,
+    Blean,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Summarize one olean: header, imports, constants and where its bytes go
@@ -81,6 +89,27 @@ enum Command {
     Convert {
         /// An NDJSON or blean export
         input: PathBuf,
+        /// Write to FILE instead of stdout
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Print what theorems' statements rest on, every proof left out, for review
+    Statement {
+        /// Root modules to load
+        #[arg(required = true, value_name = "MODULE")]
+        modules: Vec<String>,
+        /// A theorem whose statement to follow (repeatable)
+        #[arg(short, long = "const", value_name = "NAME", required = true)]
+        consts: Vec<String>,
+        /// Leave out what modules named or prefixed by these define, e.g. `Init,Std,Mathlib`
+        #[arg(short, long, value_delimiter = ',', value_name = "MODULES")]
+        trust: Vec<String>,
+        /// Raw terms to read, or the cone itself with theorems as axioms
+        #[arg(short, long, value_enum, default_value_t = Shape::Text)]
+        format: Shape,
+        /// Cut each term after N characters, 0 for no limit
+        #[arg(short, long, value_name = "N", default_value_t = 2000)]
+        max: usize,
         /// Write to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
@@ -118,6 +147,14 @@ fn main() -> ExitCode {
         Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
         Some(Command::Convert { input, output }) => convert(input, output.as_ref()),
         Some(Command::Compare { a, b, limit }) => compare(a, b, *limit),
+        Some(Command::Statement {
+            modules,
+            consts,
+            trust,
+            format,
+            max,
+            output,
+        }) => statement(&cli, modules, consts, trust, *format, *max, output.as_ref()),
         None => run(&cli),
     };
     match result {
@@ -380,6 +417,59 @@ fn export<S: Sink>(
     let counts = ex.counts();
     ex.finish()?;
     Ok(counts)
+}
+
+fn statement(
+    cli: &Cli,
+    modules: &[String],
+    consts: &[String],
+    trust: &[String],
+    format: Shape,
+    max: usize,
+    output: Option<&PathBuf>,
+) -> Res {
+    let search = search(cli)?;
+    let roots: Vec<&str> = modules.iter().map(String::as_str).collect();
+    let jobs = thread::available_parallelism().map_or(1, usize::from);
+    let env = Env::load_statements(&search, &roots, jobs, &|_, _| {})?;
+    let targets = consts
+        .iter()
+        .map(|n| {
+            env.find_name(n)
+                .ok_or_else(|| format!("unknown constant {n}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sink: Box<dyn Write + Send> = match output {
+        Some(path) => Box::new(File::create(path)?),
+        None => Box::new(io::stdout()),
+    };
+    let mut out = BufWriter::with_capacity(1 << 20, sink);
+    match format {
+        Shape::Text => thread::scope(|s| {
+            // terms print recursively, and some are deep
+            thread::Builder::new()
+                .stack_size(1 << 30)
+                .spawn_scoped(s, || {
+                    olean_export::statement::report(&env, &search, &targets, trust, max, &mut out)
+                })?
+                .join()
+                .expect("printer panicked")
+        })?,
+        Shape::Ndjson => export(
+            Exporter::new(&env, out.by_ref()).statements(),
+            &targets,
+            |_| {},
+        )
+        .map(drop)?,
+        Shape::Blean => export(
+            Exporter::with_sink(&env, Blean::new(out.by_ref())).statements(),
+            &targets,
+            |_| {},
+        )
+        .map(drop)?,
+    }
+    out.flush()?;
+    Ok(())
 }
 
 fn mmap(path: &PathBuf) -> io::Result<memmap2::Mmap> {

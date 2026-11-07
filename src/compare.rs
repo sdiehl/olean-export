@@ -10,6 +10,7 @@ use crate::{
     record::{Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Sink, Table},
 };
 use hashbrown::{hash_table::Entry, HashTable};
+use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::hash::BuildHasher;
 
@@ -36,17 +37,30 @@ enum Key {
     MData(u32),
 }
 
+const SHARDS: usize = 256;
+
 #[derive(Debug, Default)]
-struct Canon {
+struct Shard {
     nodes: Vec<Key>,
     index: HashTable<u32>,
 }
 
+/// The shared table, sharded so both streams can intern at once. Node `i` lives in shard
+/// `i % SHARDS`.
+#[derive(Debug)]
+struct Canon(Vec<Mutex<Shard>>);
+
 impl Canon {
-    fn intern(&mut self, k: Key) -> u32 {
+    fn new() -> Self {
+        Self((0..SHARDS).map(|_| Mutex::default()).collect())
+    }
+
+    fn intern(&self, k: Key) -> u32 {
         let h = FxBuildHasher.hash_one(&k);
-        let nodes = &mut self.nodes;
-        match self.index.entry(
+        let s = (h.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize % SHARDS;
+        let mut shard = self.0[s].lock();
+        let Shard { nodes, index } = &mut *shard;
+        let local = match index.entry(
             h,
             |&i| nodes[i as usize] == k,
             |&i| FxBuildHasher.hash_one(&nodes[i as usize]),
@@ -58,17 +72,24 @@ impl Canon {
                 e.insert(i);
                 i
             }
-        }
+        };
+        drop(shard);
+        u32::try_from(local as usize * SHARDS + s).expect("table overflow")
+    }
+
+    fn get(&self, n: u32) -> Key {
+        let n = n as usize;
+        self.0[n % SHARDS].lock().nodes[n / SHARDS].clone()
     }
 
     fn name(&self, n: u32) -> String {
-        let join = |p: u32, s: &str| match self.nodes[p as usize] {
+        let join = |p: u32, s: &str| match self.get(p) {
             Key::Anon => s.to_string(),
             _ => format!("{}.{s}", self.name(p)),
         };
-        match &self.nodes[n as usize] {
-            Key::NameStr(p, s) => join(*p, s),
-            Key::NameNum(p, i) => join(*p, &i.to_string()),
+        match self.get(n) {
+            Key::NameStr(p, s) => join(p, &s),
+            Key::NameNum(p, i) => join(p, &i.to_string()),
             _ => String::new(),
         }
     }
@@ -76,7 +97,7 @@ impl Canon {
 
 /// One stream's ids mapped into the shared table, and its declarations by first name.
 struct Side<'c> {
-    canon: &'c mut Canon,
+    canon: &'c Canon,
     names: Vec<u32>,
     levels: Vec<u32>,
     exprs: Vec<u32>,
@@ -86,7 +107,7 @@ struct Side<'c> {
 }
 
 impl<'c> Side<'c> {
-    fn new(canon: &'c mut Canon) -> Self {
+    fn new(canon: &'c Canon) -> Self {
         let names = vec![canon.intern(Key::Anon)];
         let levels = vec![canon.intern(Key::Zero)];
         Self {
@@ -334,17 +355,17 @@ pub fn compare(a: &[u8], b: &[u8]) -> Result<Diff> {
             crate::ndjson::read(bytes, side)
         }
     }
-    let mut canon = Canon::default();
-    let (da, ca, pa) = {
-        let mut s = Side::new(&mut canon);
-        load(a, &mut s)?;
-        (s.decls, s.count, s.dups)
+    let canon = Canon::new();
+    let side = |bytes: &[u8]| {
+        let mut s = Side::new(&canon);
+        load(bytes, &mut s).map(|()| (s.decls, s.count, s.dups))
     };
-    let (db, cb, pb) = {
-        let mut s = Side::new(&mut canon);
-        load(b, &mut s)?;
-        (s.decls, s.count, s.dups)
-    };
+    let (ra, rb) = std::thread::scope(|t| {
+        let a = t.spawn(|| side(a));
+        let b = side(b);
+        (a.join().expect("compare thread panicked"), b)
+    });
+    let ((da, ca, pa), (db, cb, pb)) = (ra?, rb?);
     let names = |ks: &mut dyn Iterator<Item = u32>| {
         let mut v: Vec<String> = ks.map(|k| canon.name(k)).collect();
         v.sort_unstable();

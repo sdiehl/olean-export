@@ -7,6 +7,7 @@ use crate::{
         Binding, Counts, Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Safety, Sink,
     },
 };
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::io::{BufRead, Write};
@@ -470,29 +471,67 @@ impl<W: Write> Ndjson<W> {
 }
 
 /// Replay lean4export NDJSON into `sink`. Ids must be consecutive, as lean4export writes them.
-pub fn read<S: Sink>(input: impl BufRead, mut sink: S) -> Result<S::Output> {
+///
+/// Lines parse in parallel batches, each while `sink` takes the batch before it.
+pub fn read<S: Sink>(mut input: impl BufRead, mut sink: S) -> Result<S::Output> {
+    const BATCH: usize = 1 << 15;
     let mut next = Counts::default();
-    for (n, line) in input.lines().enumerate() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-        let at = |e: serde_json::Error| corrupt(format!("line {}: {e}", n + 1));
-        let (id, r) = if line.starts_with(r#"{"meta":"#) {
-            let m: Meta<'_> = serde_json::from_str(&line).map_err(at)?;
-            (None, Record::Meta(m.meta.get().into()))
-        } else {
-            serde_json::from_str::<Line>(&line).map_err(at)?.record()
-        };
-        if let (Some(id), Some(want)) = (id, next.assign(&r)) {
-            if id != want {
-                return Err(corrupt(format!("line {}: id {id}, expected {want}", n + 1)));
-            }
-        }
-        sink.record(&r)?;
+    let mut base = 0;
+    let mut parsed = parse(&batch(&mut input, BATCH)?, base);
+    while let Some(records) = parsed? {
+        let lines = batch(&mut input, BATCH)?;
+        let mut ahead = Ok(None);
+        let mut fed = Ok(());
+        rayon::in_place_scope(|s| {
+            s.spawn(|_| ahead = parse(&lines, base + BATCH));
+            fed = records.iter().try_for_each(|(n, id, r)| {
+                if let (Some(id), Some(want)) = (id, next.assign(r)) {
+                    if *id != want {
+                        return Err(corrupt(format!("line {n}: id {id}, expected {want}")));
+                    }
+                }
+                sink.record(r)
+            });
+        });
+        fed?;
+        parsed = ahead;
+        base += BATCH;
     }
     sink.record(&Record::End(next))?;
     sink.finish()
+}
+
+fn batch(input: &mut impl BufRead, n: usize) -> Result<Vec<String>> {
+    input
+        .lines()
+        .take(n)
+        .collect::<std::io::Result<_>>()
+        .map_err(Into::into)
+}
+
+type Parsed = Vec<(usize, Option<u32>, Record<'static>)>;
+
+fn parse(lines: &[String], base: usize) -> Result<Option<Parsed>> {
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    lines
+        .par_iter()
+        .enumerate()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(i, line)| {
+            let n = base + i + 1;
+            let at = |e: serde_json::Error| corrupt(format!("line {n}: {e}"));
+            let (id, r) = if line.starts_with(r#"{"meta":"#) {
+                let m: Meta<'_> = serde_json::from_str(line).map_err(at)?;
+                (None, Record::Meta(m.meta.get().to_owned().into()))
+            } else {
+                serde_json::from_str::<Line>(line).map_err(at)?.record()
+            };
+            Ok((n, id, r))
+        })
+        .collect::<Result<_>>()
+        .map(Some)
 }
 
 #[derive(Deserialize)]

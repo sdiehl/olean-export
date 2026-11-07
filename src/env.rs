@@ -612,6 +612,8 @@ pub struct Env {
     pub modules: Vec<String>,
     pub header: Header,
     pub skipped: usize,
+    /// Where each module's constants end in `order`.
+    ends: Vec<usize>,
     pub(crate) lineage: u64,
     live: Option<Box<Live>>,
 }
@@ -686,6 +688,47 @@ impl Env {
         }
     }
 
+    /// Load like [`Env::load_with`], leaving every theorem value undecoded, for
+    /// [`Env::statement`] and [`crate::Exporter::statements`].
+    pub fn load_statements(
+        search: &[PathBuf],
+        roots: &[&str],
+        jobs: usize,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<Self> {
+        Self::build(search, roots, jobs, progress, false, true)
+    }
+
+    /// What the statements of `consts` rest on, with the index of each one's module, in
+    /// load order: everything their types mention, and through it the values of
+    /// definitions and whole inductive families, but no proof. Theorems reached inside
+    /// definitions count by name only, since any proof of them would do.
+    #[must_use]
+    pub fn statement(&self, consts: &[NameId]) -> Vec<(usize, NameId)> {
+        let mut w = Walk {
+            statement: true,
+            ..Walk::default()
+        };
+        let todo = consts
+            .iter()
+            .flat_map(|c| {
+                std::iter::once(Item::Const(*c)).chain(self.consts.get(c).map(|k| Item::Expr(k.ty)))
+            })
+            .collect();
+        self.walk(&mut w, todo);
+        let mut module = 0;
+        self.order
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                while self.ends.get(module).is_some_and(|&end| i >= end) {
+                    module += 1;
+                }
+                w.consts.contains(c).then_some((module, *c))
+            })
+            .collect()
+    }
+
     /// Continue `w` from `todo` over everything an export of it would visit, returning the
     /// theorems reached whose values are not decoded.
     fn walk(&self, w: &mut Walk, mut todo: Vec<Item>) -> Vec<NameId> {
@@ -726,11 +769,16 @@ impl Env {
                     let Some(k) = self.consts.get(&c) else {
                         continue;
                     };
+                    let thm = matches!(k.kind, Kind::Thm(_));
+                    if thm && w.statement {
+                        continue;
+                    }
                     todo.push(Item::Expr(k.ty));
                     let names =
                         |ns: &[NameId]| ns.iter().map(|&n| Item::Const(n)).collect::<Vec<_>>();
                     match &k.kind {
                         Kind::Axiom => {}
+                        Kind::Opaque(_) if w.statement => {}
                         Kind::Defn(Defn { value, .. }) | Kind::Opaque(Body { value, .. }) => {
                             todo.push(Item::Expr(*value));
                         }
@@ -844,6 +892,7 @@ impl Env {
             modules: Vec::new(),
             header: Header::default(),
             skipped: 0,
+            ends: Vec::new(),
             lineage: LINEAGE.fetch_add(1, Relaxed),
             live: None,
         };
@@ -896,6 +945,13 @@ impl Env {
         self.modules = loaded.iter().map(|l| l.module.clone()).collect();
         self.header = loaded.last().map(|l| l.header.clone()).unwrap_or_default();
         self.skipped = loaded.iter().map(|l| l.skipped).sum();
+        self.ends = loaded
+            .iter()
+            .scan(0, |end, l| {
+                *end += l.consts.len();
+                Some(*end)
+            })
+            .collect();
     }
 
     /// Decode again the modules whose oleans changed since the last load, add newly imported
@@ -1165,6 +1221,8 @@ enum Item {
 struct Walk {
     consts: FxHashSet<NameId>,
     exprs: Vec<bool>,
+    /// Skip proofs: the types and values of theorems and the values of opaques.
+    statement: bool,
 }
 
 /// The memo mark of an expression whose subterms are still being decoded.

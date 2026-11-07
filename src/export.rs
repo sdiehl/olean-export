@@ -60,6 +60,7 @@ pub struct Exporter<'a, S: Sink> {
     nat: Option<NameId>,
     str_deps: [Option<NameId>; 2],
     quot: [Option<NameId>; 5],
+    proofs: bool,
 }
 
 /// One step of [`Exporter::constant`]'s depth-first walk over dependencies.
@@ -138,7 +139,17 @@ impl<'a, S: Sink> Exporter<'a, S> {
                 find("Quot.lift"),
                 find("Quot.ind"),
             ],
+            proofs: true,
         }
+    }
+
+    /// Write every theorem as an axiom over its type, so an environment from
+    /// [`Env::load_statements`] exports its statements and what they rest on, with no
+    /// proofs.
+    #[must_use]
+    pub const fn statements(mut self) -> Self {
+        self.proofs = false;
+        self
     }
 
     pub fn meta(&mut self) -> Result<()> {
@@ -391,6 +402,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     };
                     match &k.kind {
                         Kind::Axiom => work.extend([Task::Emit(c), Task::Scan(k.ty)]),
+                        Kind::Thm(_) if !self.proofs => {
+                            work.extend([Task::Emit(c), Task::Scan(k.ty)]);
+                        }
                         Kind::Defn(Defn { value, .. })
                         | Kind::Thm(Theorem {
                             value: Some(value), ..
@@ -430,6 +444,14 @@ impl<'a, S: Sink> Exporter<'a, S> {
     fn write(&mut self, c: NameId) -> Result<()> {
         let k = &self.env.consts[&c];
         match &k.kind {
+            Kind::Thm(_) if !self.proofs => {
+                let head = self.header(k)?;
+                self.decl(Decl::Axiom {
+                    head,
+                    is_unsafe: false,
+                    all: None,
+                })
+            }
             Kind::Axiom => {
                 let head = self.header(k)?;
                 self.decl(Decl::Axiom {

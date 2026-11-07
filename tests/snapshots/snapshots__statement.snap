@@ -1,0 +1,60 @@
+---
+source: tests/snapshots.rs
+expression: out
+---
+-- N.add_zero, letty, Even rests on 4 declarations in 2 modules, and 0 more in Init
+-- axioms: none
+
+-- Base.lean:28-29
+theorem N.add_zero : ∀ (m : N), Eq.{1} N (N.add m N.zero) m
+
+-- Top.lean:16-18
+def letty : N → N :=
+  fun (n : N) => let m : N := N.add n n; N.add m m
+
+-- Top.lean:7-9
+inductive Even : N → Prop
+| Even.zero : Even N.zero
+| Even.succ : ∀ {n : N} (a : Odd n), Even (N.succ n)
+
+-- Base.lean:12-13
+inductive Eq.{u} : ∀ {α : Sort u} (a : α), α → Prop
+| Eq.refl.{u} : ∀ {α : Sort u} (a : α), Eq.{u} α a a
+
+-- Base.lean:21-23
+inductive N : Type
+| N.zero : N
+| N.succ : N → N
+
+-- Base.lean:25-26
+def N.add : N → N → N :=
+  fun (m : N) (n : N) => N.rec.{1} (fun (x : N) => N) m (fun (x : N) (ih : N) => N.succ ih) n
+
+-- Top.lean:10-11
+inductive Odd : N → Prop
+| Odd.succ : ∀ {n : N} (a : Even n), Odd (N.succ n)
+
+exported: inductive, inductive, def, axiom
+-- greeting, twice rests on 3 declarations in 1 module, and 0 more in Init
+-- axioms: none
+
+-- Extra.lean:51
+def greeting : String :=
+  "héllo\n\"world\""
+
+-- Extra.lean:53-55
+def twice : Nat → Nat :=
+  fun (n : Nat) => let m : Nat := Nat.add n n; Nat.add m m
+
+-- Extra.lean:37-38
+inductive String : Type
+| String.mk : Nat → String
+
+-- Extra.lean:34-35
+def Nat.add : Nat → Nat → Nat :=
+  fun (m : Nat) (n : Nat) => Nat.rec.{1} (fun (x : Nat) => Nat) m (fun (x : Nat) (ih : Nat) => Nat.succ ih) n
+
+-- Extra.lean:25-27
+inductive Nat : Type
+| Nat.zero : Nat
+| Nat.succ : Nat → Nat
