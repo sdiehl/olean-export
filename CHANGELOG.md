@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-11-09)
 
 - Add `--per-module` exports and `join` to merge them.
 - Add `keys`, closure keys per declaration (`key::Keys`).
