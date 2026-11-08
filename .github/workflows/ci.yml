@@ -54,7 +54,7 @@ jobs:
 
       - name: Cache nl-fast
         id: nl-fast
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/nl-fast
           key: nl-fast-54ce971
