@@ -42,6 +42,8 @@ pub struct Env {
     pub order: Vec<NameId>,
     pub recursors: FxHashMap<NameId, Vec<NameId>>,
     pub modules: Vec<String>,
+    /// The direct imports of each module in `modules`.
+    pub imports: Vec<Vec<String>>,
     pub header: Header,
     pub skipped: usize,
     /// Where each module's constants end in `order`.
@@ -195,6 +197,7 @@ impl Env {
             order: Vec::new(),
             recursors: FxHashMap::default(),
             modules: Vec::new(),
+            imports: Vec::new(),
             header: Header::default(),
             skipped: 0,
             ends: Vec::new(),
@@ -233,6 +236,7 @@ impl Env {
             recursors: m.recursors,
             skipped: m.skipped,
             header: m.header,
+            imports: m.imports,
             pending: m.pending,
         }
     }
@@ -244,10 +248,17 @@ impl Env {
             .flat_map(|l| l.consts.iter().copied())
             .collect();
         self.recursors.clear();
+        // two modules may both declare a type, as realized or independent copies
         for (ind, recs) in loaded.iter().flat_map(|l| &l.recursors) {
-            self.recursors.entry(*ind).or_default().extend(recs);
+            let all = self.recursors.entry(*ind).or_default();
+            for r in recs {
+                if !all.contains(r) {
+                    all.push(*r);
+                }
+            }
         }
         self.modules = loaded.iter().map(|l| l.module.clone()).collect();
+        self.imports = loaded.iter().map(|l| l.imports.clone()).collect();
         self.header = loaded.last().map(|l| l.header.clone()).unwrap_or_default();
         self.skipped = loaded.iter().map(|l| l.skipped).sum();
         self.ends = loaded
@@ -257,6 +268,13 @@ impl Env {
                 Some(*end)
             })
             .collect();
+    }
+
+    /// The constants module `m` declares, in load order.
+    #[must_use]
+    pub fn module_consts(&self, m: usize) -> &[NameId] {
+        let start = m.checked_sub(1).map_or(0, |p| self.ends[p]);
+        &self.order[start..self.ends[m]]
     }
 
     /// The constants `lean4export` exports when given no explicit names.

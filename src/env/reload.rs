@@ -40,6 +40,7 @@ pub(super) struct Loaded {
     pub(super) recursors: FxHashMap<NameId, Vec<NameId>>,
     pub(super) skipped: usize,
     pub(super) header: Header,
+    pub(super) imports: Vec<String>,
     pub(super) pending: Vec<(NameId, u64)>,
 }
 

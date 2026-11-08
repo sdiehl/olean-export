@@ -107,6 +107,113 @@ impl Record<'_> {
     }
 }
 
+impl Record<'_> {
+    /// Rewrite every id the record refers to with `f`, given the table it points into.
+    pub fn map_ids(&mut self, f: &impl Fn(Table, u32) -> u32) {
+        let n = |x: &mut u32| *x = f(Table::Names, *x);
+        let l = |x: &mut u32| *x = f(Table::Levels, *x);
+        let e = |x: &mut u32| *x = f(Table::Exprs, *x);
+        let head = |h: &mut Head| {
+            n(&mut h.name);
+            h.level_params.iter_mut().for_each(n);
+            e(&mut h.ty);
+        };
+        match self {
+            Self::Meta(_) | Self::BVar(_) | Self::Nat(_) | Self::Str(_) | Self::End(_) => {}
+            Self::NameStr { pre, .. } | Self::NameNum { pre, .. } => n(pre),
+            Self::Succ(a) | Self::Sort(a) => l(a),
+            Self::Max(a, b) | Self::IMax(a, b) => {
+                l(a);
+                l(b);
+            }
+            Self::Param(p) => n(p),
+            Self::Const { name, us } => {
+                n(name);
+                us.iter_mut().for_each(l);
+            }
+            Self::App { fun, arg } => {
+                e(fun);
+                e(arg);
+            }
+            Self::Lam(b) | Self::Pi(b) => {
+                n(&mut b.name);
+                e(&mut b.ty);
+                e(&mut b.body);
+            }
+            Self::Let {
+                name,
+                ty,
+                value,
+                body,
+                ..
+            } => {
+                n(name);
+                e(ty);
+                e(value);
+                e(body);
+            }
+            Self::Proj {
+                type_name, struct_, ..
+            } => {
+                n(type_name);
+                e(struct_);
+            }
+            Self::MData(x) => e(x),
+            Self::Decl(d) => match d {
+                Decl::Axiom { head: h, all, .. } => {
+                    head(h);
+                    all.iter_mut().flatten().for_each(n);
+                }
+                Decl::Def {
+                    head: h,
+                    value,
+                    all,
+                    ..
+                }
+                | Decl::Thm {
+                    head: h,
+                    value,
+                    all,
+                } => {
+                    head(h);
+                    e(value);
+                    all.iter_mut().for_each(n);
+                }
+                Decl::Opaque {
+                    head: h,
+                    value,
+                    all,
+                    ..
+                } => {
+                    head(h);
+                    e(value);
+                    all.iter_mut().flatten().for_each(n);
+                }
+                Decl::Quot { head: h, .. } => head(h),
+                Decl::Inductive { types, ctors, recs } => {
+                    for t in types {
+                        head(&mut t.head);
+                        t.all.iter_mut().for_each(n);
+                        t.ctors.iter_mut().for_each(n);
+                    }
+                    for c in ctors {
+                        head(&mut c.head);
+                        n(&mut c.induct);
+                    }
+                    for r in recs {
+                        head(&mut r.head);
+                        r.all.iter_mut().for_each(n);
+                        for rule in &mut r.rules {
+                            n(&mut rule.ctor);
+                            e(&mut rule.rhs);
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Table {
     Names,
@@ -177,6 +284,21 @@ pub enum Decl {
         ctors: Vec<IndCtor>,
         recs: Vec<IndRec>,
     },
+}
+
+impl Decl {
+    /// The declared name, the first type's for an inductive block.
+    #[must_use]
+    pub fn name(&self) -> Option<u32> {
+        match self {
+            Self::Axiom { head, .. }
+            | Self::Def { head, .. }
+            | Self::Thm { head, .. }
+            | Self::Opaque { head, .. }
+            | Self::Quot { head, .. } => Some(head.name),
+            Self::Inductive { types, .. } => types.first().map(|t| t.head.name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

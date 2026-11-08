@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use olean_export::{
     blean::{self, Blean},
+    key::Keys,
     ndjson::{self, Ndjson},
     resolve, search_path, statement, Env, Exporter, NameId, Sink, Summary,
 };
@@ -58,6 +59,9 @@ struct Cli {
     /// Show peak resident memory in the progress bars and summary
     #[arg(long)]
     rss: bool,
+    /// Write each module to its own file in DIR, see docs/INCREMENTAL.md
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["output", "consts"])]
+    per_module: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -116,6 +120,25 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+    /// Join per-module exports into one, imports first
+    Join {
+        /// Per-module NDJSON or blean exports
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Write to FILE instead of stdout
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Output format
+        #[arg(short, long, value_enum, default_value_t = Format::Ndjson)]
+        format: Format,
+    },
+    /// Print the incremental checking key of every declaration in an export
+    Keys {
+        /// An NDJSON or blean export
+        input: PathBuf,
+    },
+    /// Summarize an accepted store: each checker, its tag and key count
+    Accepted { file: PathBuf },
     /// Compare two exports, NDJSON or blean, up to id numbering and record order
     Compare {
         a: PathBuf,
@@ -149,6 +172,13 @@ fn main() -> ExitCode {
         Some(Command::Inspect { target, consts }) => inspect(&cli, target, *consts),
         Some(Command::Convert { input, output }) => convert(input, output.as_ref()),
         Some(Command::Compare { a, b, limit }) => compare(a, b, *limit),
+        Some(Command::Join {
+            files,
+            output,
+            format,
+        }) => join(files, output.as_ref(), *format),
+        Some(Command::Keys { input }) => keys(input),
+        Some(Command::Accepted { file }) => accepted(file),
         Some(Command::Statement {
             modules,
             consts,
@@ -344,6 +374,19 @@ fn run(cli: &Cli) -> Res {
     pb.finish_and_clear();
     let loaded = start.elapsed();
 
+    if let Some(dir) = &cli.per_module {
+        let files = olean_export::join::split(&env, dir, cli.format == Format::Blean)?;
+        if !cli.quiet {
+            eprintln!(
+                "{} modules written to {} in {:.2}s",
+                HumanCount(files.len() as u64),
+                dir.display(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+        return Ok(());
+    }
+
     let targets = if cli.consts.is_empty() {
         env.roots().collect()
     } else {
@@ -533,6 +576,76 @@ fn convert(input: &PathBuf, output: Option<&PathBuf>) -> Res {
         blean::read(&map, Ndjson::new(out))?;
     } else {
         ndjson::read(&map[..], Blean::new(out))?;
+    }
+    Ok(())
+}
+
+fn out(output: Option<&PathBuf>) -> io::Result<BufWriter<Box<dyn Write>>> {
+    let sink: Box<dyn Write> = match output {
+        Some(path) => Box::new(File::create(path)?),
+        None => Box::new(io::stdout().lock()),
+    };
+    Ok(BufWriter::with_capacity(1 << 20, sink))
+}
+
+fn join(files: &[PathBuf], output: Option<&PathBuf>, format: Format) -> Res {
+    let maps = files.iter().map(mmap).collect::<io::Result<Vec<_>>>()?;
+    let bytes: Vec<&[u8]> = maps.iter().map(|m| &m[..]).collect();
+    let out = out(output)?;
+    let mut out = match format {
+        Format::Ndjson => olean_export::join::join(&bytes, Ndjson::new(out))?,
+        Format::Blean => olean_export::join::join(&bytes, Blean::new(out))?,
+    };
+    out.flush()?;
+    Ok(())
+}
+
+fn keys(input: &PathBuf) -> Res {
+    let map = mmap(input)?;
+    let mut k = Keys::new();
+    // keys are computed recursively over terms, as checkers do
+    thread::scope(|s| {
+        thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn_scoped(s, || {
+                if blean::sniff(&map) {
+                    blean::read(&map, &mut k)
+                } else {
+                    ndjson::read(&map[..], &mut k)
+                }
+            })?
+            .join()
+            .map_err(|_| "key thread panicked")?
+            .map_err(Box::<dyn Error + Send + Sync>::from)
+    })?;
+    let mut out = out(None)?;
+    for d in k.into_keys() {
+        let key = d.key.map_or_else(|| "-".repeat(64), |k| hex(&k));
+        writeln!(out, "{key} {} {}", d.offset, d.name)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    b.iter().fold(String::new(), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    })
+}
+
+fn accepted(file: &PathBuf) -> Res {
+    let map = mmap(file)?;
+    let mut out = io::stdout().lock();
+    for s in olean_export::accepted::parse(&map)? {
+        writeln!(
+            out,
+            "{}  {}  {} keys",
+            hex(&s.tag),
+            s.checker,
+            HumanCount(s.keys.len() as u64)
+        )?;
     }
     Ok(())
 }

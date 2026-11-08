@@ -1,6 +1,8 @@
 # olean-export
 
-Rust library to read Lean `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
+Rust library for reading and manipulating `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
+
+Mostly designed around the ideas of having efficient external binary formats, doing incremental and transitive-cone checking.
 
 The big idea is an `.olean` is already a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But much faster.
 
@@ -39,8 +41,6 @@ experimental checks 967.17µs: 39 attempted, 0 failures, 0 fallbacks
 bridged quot 0 ind 7 ctor 8 rec 7
 ```
 
-Without `-c` it exports every constant reachable from the module, like `lean4export Hello`.
-
 ## BLean
 
 Blean is a new binary format that is more efficient to mmap and read than NDJSON.
@@ -51,27 +51,29 @@ Add `-f blean` for the same stream in a compact binary form, see [docs/BLEAN.md]
 lake env olean-export Hello -c double_two -f blean -o hello.blean
 ```
 
-## Performance
+## Cone Export
 
-Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`. With `-c`, theorem values outside the cone stay undecoded. `--rss` shows peak resident memory.
+A cone is a set of constants plus everything they mention. Without `-c` the export is the cone of every constant in the loaded modules, like `lean4export`.
 
-Wall time:
+- `-c NAME` (repeatable) exports the full cone of `NAME`, proofs included. Only theorem values inside the cone are decoded, the rest stay in their oleans.
+- `statement -c NAME` follows only the statement: types, definition bodies and whole inductive families, no proofs. Theorems it reaches are taken as stated. It prints raw terms with source lines for review (`-m N` cuts long terms), or with `-f ndjson|blean` exports the cone with theorems as axioms for a checker.
+- `statement --trust MODULES` leaves out what those modules, or modules under them, define, so you can review the trusted base of a Tau Ceti theorem without reading all of Tau Ceti.
 
-| Target                     | lean4export | olean-export | Speedup |
-| -------------------------- | ----------- | ------------ | ------- |
-| Small model on `Lean`      | 18.3s       | 1.0s         | 18x     |
-| All of Mathlib             | 1526s       | 18s          | 85x     |
-| One Mathlib theorem (`-c`) | 16.5s       | 5.3s         | 3x      |
+```bash
+lake env olean-export Mathlib -c Fin.insertNth_apply_succAbove -f blean -o thm.blean
+lake env olean-export statement FLT -c THEOREM --trust Init,Std,Lean,Mathlib
+```
 
-Peak memory:
+In the library: `Env::load_cone` then `Exporter::constant` for full cones, `Env::load_statements` then `Env::statement` or `Exporter::statements` for statement cones.
 
-| Target                     | lean4export | olean-export |
-| -------------------------- | ----------- | ------------ |
-| Small model on `Lean`      | 1.3 GB      | 0.5 GB       |
-| All of Mathlib             | 9.4 GB      | 4.3 GB       |
-| One Mathlib theorem (`-c`) | 5.6 GB      | 2.0 GB       |
+## Incremental
 
-Mathlib is on Lean 4.35.0 (712,205 declarations, identical under `compare`), and the theorem is `Fin.insertNth_apply_succAbove`.
+`--per-module DIR` writes one export per module, pinned to its imports by hash, and `join` merges them back into one. `keys` prints a closure key per declaration, and `accepted` lists a store of keys checkers have already accepted.
+
+```bash
+lake env olean-export Mathlib --per-module out/
+olean-export join out/*.ndjson -o mathlib.ndjson
+```
 
 ## Inspect
 
@@ -105,13 +107,27 @@ $ olean-export compare want.ndjson got.blean
 33 / 33 declarations: 0 only in the first, 0 only in the second, 0 differ, 0 duplicate
 ```
 
-## Statement
+## Performance
 
-`statement` prints every definition, structure and axiom a theorem's statement rests on, as raw terms with source lines and no proofs, so you can review the trusted base of, say, a Tau Ceti theorem without reading all of Tau Ceti. `--trust` hides what you already believe, and `-f ndjson` exports the cone for a checker.
+Modules decode in parallel on every core, and `-j N` sets the thread count. The output is identical for any `-j`. `--rss` shows peak resident memory.
 
-```bash
-$ olean-export statement FLT -c THEOREM --trust Init,Std,Lean,Mathlib
-```
+Wall time:
+
+| Target                     | lean4export | olean-export | Speedup |
+| -------------------------- | ----------- | ------------ | ------- |
+| Small model on `Lean`      | 18.3s       | 1.0s         | 18x     |
+| All of Mathlib             | 1526s       | 18s          | 85x     |
+| One Mathlib theorem (`-c`) | 16.5s       | 5.3s         | 3x      |
+
+Peak memory:
+
+| Target                     | lean4export | olean-export |
+| -------------------------- | ----------- | ------------ |
+| Small model on `Lean`      | 1.3 GB      | 0.5 GB       |
+| All of Mathlib             | 9.4 GB      | 4.3 GB       |
+| One Mathlib theorem (`-c`) | 5.6 GB      | 2.0 GB       |
+
+Mathlib is on Lean 4.35.0 (712,205 declarations, identical under `compare`), and the theorem is `Fin.insertNth_apply_succAbove`.
 
 ## License
 

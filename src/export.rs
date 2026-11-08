@@ -9,7 +9,7 @@ use crate::{
         Binding, Counts, Decl, Head, IndCtor, IndRec, IndRule, IndType, Record, Safety, Sink,
     },
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::Write;
 
 const UNSEEN: u32 = u32::MAX;
@@ -59,6 +59,79 @@ pub struct Exporter<'a, S: Sink> {
     visited: FxHashSet<NameId>,
     builtins: Builtins,
     depth: Depth,
+    scope: Option<Box<Scope>>,
+}
+
+/// Per-module export: which modules declare each constant, what each module imports
+/// transitively, the module being written, and the entries its file took, to clear before
+/// the next. Lean realizes some constants, such as equation lemmas, in every module that
+/// needs them, and the environment keeps one copy, which may refer to private constants of
+/// a module the writer does not import. So a file holds what its module declares and
+/// whatever else it needs that no import provides.
+#[derive(Debug, Default)]
+struct Scope {
+    owner: FxHashMap<NameId, u32>,
+    more: FxHashMap<NameId, Vec<u32>>,
+    closure: Vec<Vec<u64>>,
+    module: u32,
+    names: Vec<NameId>,
+    levels: Vec<LevelId>,
+    exprs: Vec<ExprId>,
+    scanned: Vec<ExprId>,
+    visited: Vec<NameId>,
+}
+
+impl Scope {
+    fn new(env: &Env) -> Self {
+        let mut s = Self::default();
+        for m in 0..env.modules.len() {
+            let m32 = u32::try_from(m).expect("module count");
+            for &c in env.module_consts(m) {
+                if let Some(&o) = s.owner.get(&c) {
+                    if o != m32 {
+                        s.more.entry(c).or_default().push(m32);
+                    }
+                } else {
+                    s.owner.insert(c, m32);
+                }
+            }
+        }
+        let index: FxHashMap<&str, usize> = env
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.as_str(), i))
+            .collect();
+        let words = env.modules.len().div_ceil(64);
+        for imports in &env.imports {
+            let mut bits = vec![0u64; words];
+            for &j in imports.iter().filter_map(|i| index.get(i.as_str())) {
+                if let Some(c) = s.closure.get(j) {
+                    bits.iter_mut().zip(c).for_each(|(b, c)| *b |= c);
+                    bits[j / 64] |= 1 << (j % 64);
+                }
+            }
+            s.closure.push(bits);
+        }
+        s
+    }
+
+    /// Whether the module being written writes `c`, rather than an import providing it.
+    fn writes(&self, c: NameId) -> bool {
+        let Some(&first) = self.owner.get(&c) else {
+            return true;
+        };
+        let owners = std::iter::once(first).chain(self.more.get(&c).into_iter().flatten().copied());
+        let mut provided = false;
+        for o in owners {
+            if o == self.module {
+                return true;
+            }
+            let bits = &self.closure[self.module as usize];
+            provided |= bits[o as usize / 64] >> (o % 64) & 1 == 1;
+        }
+        !provided
+    }
 }
 
 /// One step of [`Exporter::constant`]'s depth-first walk over dependencies.
@@ -104,7 +177,58 @@ impl<'a, S: Sink> Exporter<'a, S> {
             visited: m.visited,
             builtins: Builtins::find(env),
             depth: Depth::Full,
+            scope: None,
         }
+    }
+
+    /// An exporter that writes one module at a time with [`Exporter::module`], each to its
+    /// own sink after [`Exporter::split`]. A module's records refer to what its imports
+    /// declare by name only.
+    pub fn per_module(env: &'a Env, sink: S) -> Self {
+        let mut ex = Self::with_sink(env, sink);
+        ex.scope = Some(Box::new(Scope::new(env)));
+        ex
+    }
+
+    /// Write every constant module `m` declares. Internal ones are included, since a later
+    /// module may need them.
+    pub fn module(&mut self, m: usize) -> Result<()> {
+        let s = self
+            .scope
+            .as_mut()
+            .ok_or(Error::Misuse("module needs a per-module exporter"))?;
+        s.module = u32::try_from(m).expect("module count");
+        let env = self.env;
+        env.module_consts(m)
+            .iter()
+            .try_for_each(|&c| self.constant(c))
+    }
+
+    /// End the current file and start the next on `sink`, with ids from the start again.
+    /// Returns the finished sink's output.
+    pub fn split(&mut self, sink: S) -> Result<S::Output> {
+        let s = self
+            .scope
+            .as_mut()
+            .ok_or(Error::Misuse("split needs a per-module exporter"))?;
+        for n in s.names.drain(..) {
+            self.names[n.index()] = UNSEEN;
+        }
+        for l in s.levels.drain(..) {
+            self.levels[l.index()] = UNSEEN;
+        }
+        for e in s.exprs.drain(..) {
+            self.exprs[e.index()] = UNSEEN;
+        }
+        for e in s.scanned.drain(..) {
+            self.scanned[e.index()] = false;
+        }
+        for c in s.visited.drain(..) {
+            self.visited.remove(&c);
+        }
+        self.sink.record(None, &Record::End(self.next))?;
+        self.next = Counts::default();
+        std::mem::replace(&mut self.sink, sink).finish()
     }
 
     /// Write every theorem as an axiom over its type, so an environment from
@@ -117,12 +241,20 @@ impl<'a, S: Sink> Exporter<'a, S> {
     }
 
     pub fn meta(&mut self) -> Result<()> {
+        self.meta_with(None)
+    }
+
+    /// The `meta` record, with `module` added under that key when given.
+    pub fn meta_with(&mut self, module: Option<serde_json::Value>) -> Result<()> {
         let h = &self.env.header;
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "exporter": {"name": "olean-export", "version": env!("CARGO_PKG_VERSION")},
             "format": {"version": "3.1.0"},
             "lean": {"githash": h.githash, "version": h.version},
         });
+        if let Some(m) = module {
+            meta["module"] = m;
+        }
         self.sink
             .record(None, &Record::Meta(meta.to_string().into()))
     }
@@ -194,6 +326,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
             }
         };
         self.names[n.index()] = id;
+        if let Some(s) = &mut self.scope {
+            s.names.push(n);
+        }
         Ok(id)
     }
 
@@ -227,6 +362,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
         };
         let id = self.emit(&r)?;
         self.levels[l.index()] = id;
+        if let Some(s) = &mut self.scope {
+            s.levels.push(l);
+        }
         Ok(id)
     }
 
@@ -318,6 +456,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
             };
             let id = self.emit(&r)?;
             self.exprs[e.index()] = id;
+            if let Some(s) = &mut self.scope {
+                s.exprs.push(e);
+            }
         }
         Ok(self.exprs[root.index()])
     }
@@ -339,6 +480,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
     pub fn constant(&mut self, c: NameId) -> Result<()> {
         let env = self.env;
         let mut work = vec![Task::Const(c)];
+        let mut members = Vec::new();
         while let Some(task) = work.pop() {
             match task {
                 Task::Scan(e) => {
@@ -353,9 +495,17 @@ impl<'a, S: Sink> Exporter<'a, S> {
                         work[at..].reverse();
                     }
                 }
-                Task::Scanned(e) => self.scanned[e.index()] = true,
+                Task::Scanned(e) => {
+                    self.scanned[e.index()] = true;
+                    if let Some(s) = &mut self.scope {
+                        s.scanned.push(e);
+                    }
+                }
                 Task::Const(c) => {
-                    if !self.visited.insert(c) {
+                    if self.scope.as_ref().is_some_and(|s| !s.writes(c)) {
+                        continue;
+                    }
+                    if !self.visit(c) {
                         continue;
                     }
                     let Some(k) = env.consts.get(&c) else {
@@ -369,9 +519,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     env.mentions(k, self.depth, &self.builtins, |d| match d {
                         Dep::Expr(e) => work.push(Task::Scan(e)),
                         Dep::Const(c) => work.push(Task::Const(c)),
-                        Dep::Member(c) => {
-                            self.visited.insert(c);
-                        }
+                        Dep::Member(c) => members.push(c),
                         Dep::Literal(_) => {}
                         Dep::Unloaded(c) => unloaded = Some(c),
                     })?;
@@ -382,11 +530,22 @@ impl<'a, S: Sink> Exporter<'a, S> {
                         )));
                     }
                     work[at..].reverse();
+                    for c in std::mem::take(&mut members) {
+                        self.visit(c);
+                    }
                 }
                 Task::Emit(c) => self.write(c)?,
             }
         }
         Ok(())
+    }
+
+    fn visit(&mut self, c: NameId) -> bool {
+        let new = self.visited.insert(c);
+        if let Some(s) = self.scope.as_mut().filter(|_| new) {
+            s.visited.push(c);
+        }
+        new
     }
 
     /// Write the declaration of `c`, whose dependencies are already out.

@@ -28,6 +28,7 @@ pub(super) struct Module {
     pub(super) recursors: FxHashMap<NameId, Vec<NameId>>,
     pub(super) skipped: usize,
     pub(super) header: Header,
+    pub(super) imports: Vec<String>,
     /// Theorems whose values were left in the olean, with the values' addresses.
     pub(super) pending: Vec<(NameId, u64)>,
 }
@@ -42,6 +43,7 @@ fn decode(
     let img = Image::open_module(path)?;
     let mut dec = Decoder::new(&img, tables, rank, cursor, lazy);
     dec.run().map_err(at(path))?;
+    dec.module.imports = img.imports().map_err(at(path))?;
     Ok(dec.module)
 }
 
@@ -151,6 +153,7 @@ impl<'a> Decoder<'a> {
                 recursors: FxHashMap::default(),
                 skipped: 0,
                 header: img.header.clone(),
+                imports: Vec::new(),
                 pending: Vec::new(),
             },
             lazy,

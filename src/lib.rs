@@ -10,6 +10,7 @@
     clippy::many_single_char_names
 )]
 
+pub mod accepted;
 pub mod blean;
 pub mod compare;
 mod env;
@@ -17,6 +18,8 @@ mod error;
 mod export;
 pub mod info;
 mod inspect;
+pub mod join;
+pub mod key;
 pub mod ndjson;
 mod olean;
 pub mod record;
