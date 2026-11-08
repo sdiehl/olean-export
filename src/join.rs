@@ -1,4 +1,4 @@
-//! Per-module exports and joining them back into one. See docs/INCREMENTAL.md.
+//! Per-module exports and joining them back into one.
 
 use crate::{
     blean::{self, Blean},

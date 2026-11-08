@@ -1,4 +1,4 @@
-//! Declaration keys, the reference implementation of docs/INCREMENTAL.md.
+//! Declaration keys, shared by external checkers.
 //!
 //! A unit is one declaration, or one inductive block, and its key is the blake3 hash of a
 //! canonical encoding of the unit that names every constant it mentions from an earlier

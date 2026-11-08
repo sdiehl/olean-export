@@ -59,7 +59,7 @@ struct Cli {
     /// Show peak resident memory in the progress bars and summary
     #[arg(long)]
     rss: bool,
-    /// Write each module to its own file in DIR, see docs/INCREMENTAL.md
+    /// Write each module to its own file in DIR
     #[arg(long, value_name = "DIR", conflicts_with_all = ["output", "consts"])]
     per_module: Option<PathBuf>,
 }

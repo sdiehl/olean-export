@@ -1,5 +1,5 @@
 //! Accepted stores: the declaration keys each checker has accepted, one section per checker,
-//! so several checkers share one file. See docs/INCREMENTAL.md.
+//! so several checkers share one file.
 //!
 //! Layout: `MAGIC`, a little-endian `u32` section count, then per section a `u32` name length,
 //! the checker name, a 32-byte tag the checker defines, a `u64` key count, and the sorted keys.
