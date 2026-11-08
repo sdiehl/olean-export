@@ -64,8 +64,6 @@ lake env olean-export Mathlib -c Fin.insertNth_apply_succAbove -f blean -o thm.b
 lake env olean-export statement FLT -c THEOREM --trust Init,Std,Lean,Mathlib
 ```
 
-In the library: `Env::load_cone` then `Exporter::constant` for full cones, `Env::load_statements` then `Env::statement` or `Exporter::statements` for statement cones.
-
 ## Incremental
 
 `--per-module DIR` writes one export per module, pinned to its imports by hash, and `join` merges them back into one. `keys` prints a closure key per declaration, and `accepted` lists a store of keys checkers have already accepted.
