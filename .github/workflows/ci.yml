@@ -30,7 +30,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check markdown, JSON and TOML
-        uses: dprint/check@v2.5
+        uses: dprint/check@v2.6
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
