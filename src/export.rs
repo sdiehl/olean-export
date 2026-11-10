@@ -87,7 +87,7 @@ struct Scope {
     visited: Vec<NameId>,
 }
 
-fn has(bits: &[u64], i: usize) -> bool {
+const fn has(bits: &[u64], i: usize) -> bool {
     bits[i / 64] >> (i % 64) & 1 == 1
 }
 

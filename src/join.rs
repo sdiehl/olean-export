@@ -258,29 +258,40 @@ impl<S: Sink> Sink for &mut Shift<'_, S> {
 /// levels and expressions two modules share appear once per module, a declaration two
 /// modules make appears once.
 pub fn join<S: Sink>(files: &[&[u8]], sink: S) -> Result<S::Output> {
-    merge(files, order(files)?, sink)
+    merge(files, &order(files)?, None, sink)
 }
 
 /// Join the files [`view`] picks for `root`.
+///
+/// The meta's `view` names the module and how many declarations come before its own. A
+/// checker may take those as given: Lean checks a statement where its module's imports
+/// unfold, not where an importer sees them hidden.
 pub fn join_view<S: Sink>(files: &[&[u8]], root: &str, sink: S) -> Result<S::Output> {
-    merge(files, view(files, root)?, sink)
+    merge(files, &view(files, root)?, Some(root), sink)
 }
 
-fn merge<S: Sink>(files: &[&[u8]], order: Vec<usize>, mut sink: S) -> Result<S::Output> {
-    let Some(&first) = order.first() else {
-        return Err(corrupt("nothing to join"));
-    };
-    let mut m = meta(files[first])?;
-    if let Some(o) = m.as_object_mut() {
-        o.remove("module");
+struct Count(u64);
+
+impl Sink for Count {
+    type Output = ();
+
+    fn record(&mut self, _: Option<u32>, r: &Record<'_>) -> Result<()> {
+        self.0 += u64::from(matches!(r, Record::Decl(_)));
+        Ok(())
     }
-    sink.record(None, &Record::Meta(m.to_string().into()))?;
+
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn pour<S: Sink>(files: &[&[u8]], order: &[usize], sink: &mut S) -> Result<Counts> {
     let mut next = Counts::default();
     let mut names = vec![0];
     let mut declared = FxHashSet::default();
-    for i in order {
+    for &i in order {
         let mut shift = Shift {
-            sink: &mut sink,
+            sink: &mut *sink,
             base: next,
             next,
             names: &mut names,
@@ -294,6 +305,32 @@ fn merge<S: Sink>(files: &[&[u8]], order: Vec<usize>, mut sink: S) -> Result<S::
         }
         next = shift.next;
     }
+    Ok(next)
+}
+
+fn merge<S: Sink>(
+    files: &[&[u8]],
+    order: &[usize],
+    root: Option<&str>,
+    mut sink: S,
+) -> Result<S::Output> {
+    let Some((_, imports)) = order.split_last() else {
+        return Err(corrupt("nothing to join"));
+    };
+    let mut m = meta(files[order[0]])?;
+    if let Some(o) = m.as_object_mut() {
+        o.remove("module");
+        if let Some(root) = root {
+            let mut n = Count(0);
+            pour(files, imports, &mut n)?;
+            o.insert(
+                "view".into(),
+                serde_json::json!({"module": root, "imported": n.0}),
+            );
+        }
+    }
+    sink.record(None, &Record::Meta(m.to_string().into()))?;
+    let next = pour(files, order, &mut sink)?;
     sink.record(None, &Record::End(next))?;
     sink.finish()
 }

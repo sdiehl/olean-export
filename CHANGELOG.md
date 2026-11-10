@@ -4,6 +4,7 @@
 
 - Add `--interfaces`, per-module exports that follow the module system.
 - Add `join -m MODULE`, one module over its imports' interfaces.
+- A view's meta marks where imported declarations end, in `view.imported`.
 - Per-module imports carry `all`, `public` and `meta`, so file hashes change.
 - `Env::imports` holds `inspect::Import`, and `Env::exported` what a module exports.
 
