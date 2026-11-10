@@ -82,7 +82,7 @@ olean-export join out/*.ndjson -o mathlib.ndjson
 
 ```bash
 lake env olean-export Std --per-module out/ --interfaces
-olean-export join -m Std.Data.HashMap.Lemmas out/*.ndjson out/public/*.ndjson -o view.ndjson
+olean-export join -m Std.Data.HashMap.Lemmas out/ -o view.ndjson
 ```
 
 ## Inspect

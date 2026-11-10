@@ -127,7 +127,7 @@ enum Command {
     },
     /// Join per-module exports into one, imports first
     Join {
-        /// Per-module NDJSON or blean exports
+        /// Per-module NDJSON or blean exports, or a --per-module directory of them
         #[arg(required = true)]
         files: Vec<PathBuf>,
         /// Join only MODULE and what the module system shows it, from --interfaces exports
@@ -608,7 +608,27 @@ fn out(output: Option<&PathBuf>) -> io::Result<BufWriter<Box<dyn Write>>> {
 
 fn join(files: &[PathBuf], module: Option<&str>, output: Option<&PathBuf>, format: Format) -> Res {
     use olean_export::join::join;
-    let maps = files.iter().map(mmap).collect::<io::Result<Vec<_>>>()?;
+    let mut paths = Vec::new();
+    for f in files {
+        if !f.is_dir() {
+            paths.push(f.clone());
+            continue;
+        }
+        // interfaces only matter to a view, and a whole join would see each module twice
+        let public = module.map(|_| f.join("public"));
+        for d in std::iter::once(f.clone()).chain(public) {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                continue;
+            };
+            for e in entries {
+                let p = e?.path();
+                if p.extension().is_some_and(|x| x == "ndjson" || x == "blean") {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    let maps = paths.iter().map(mmap).collect::<io::Result<Vec<_>>>()?;
     let bytes: Vec<&[u8]> = maps.iter().map(|m| &m[..]).collect();
     let out = out(output)?;
     let mut out = match format {
