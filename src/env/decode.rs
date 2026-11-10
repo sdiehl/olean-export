@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     error::{at, corrupt, Error, Result},
+    inspect::Import,
     olean::{
         is_scalar, small_nat, Header, Image, Safety, AXIOM, CTOR, DEFN, INDUCT, OPAQUE, QUOT, REC,
         THM,
@@ -28,7 +29,8 @@ pub(super) struct Module {
     pub(super) recursors: FxHashMap<NameId, Vec<NameId>>,
     pub(super) skipped: usize,
     pub(super) header: Header,
-    pub(super) imports: Vec<String>,
+    pub(super) imports: Vec<Import>,
+    pub(super) exported: Option<FxHashMap<NameId, bool>>,
     /// Theorems whose values were left in the olean, with the values' addresses.
     pub(super) pending: Vec<(NameId, u64)>,
 }
@@ -77,11 +79,18 @@ pub(super) fn decode_all(
 }
 
 impl Image {
-    pub(crate) fn imports(&self) -> Result<Vec<String>> {
+    pub(crate) fn imports(&self) -> Result<Vec<Import>> {
         let imports = self.array(self.field(self.root, 0)?)?;
         imports
             .into_iter()
-            .map(|i| self.str_name(self.field(i, 0)?))
+            .map(|i| {
+                Ok(Import {
+                    module: self.str_name(self.field(i, 0)?)?,
+                    all: self.scalar_u8(i, 0)? != 0,
+                    exported: self.scalar_u8(i, 1)? != 0,
+                    meta: self.scalar_u8(i, 2)? != 0,
+                })
+            })
             .collect()
     }
 
@@ -154,6 +163,7 @@ impl<'a> Decoder<'a> {
                 skipped: 0,
                 header: img.header.clone(),
                 imports: Vec::new(),
+                exported: None,
                 pending: Vec::new(),
             },
             lazy,
@@ -165,6 +175,35 @@ impl<'a> Decoder<'a> {
         for c in img.array(img.field(img.root, 2)?)? {
             self.constant(c)?;
         }
+        if img.parts.len() > 1 {
+            self.exported()?;
+        }
+        Ok(())
+    }
+
+    /// The public part holds a hidden proof or body as an axiom over the same type.
+    fn exported(&mut self) -> Result<()> {
+        let img = self.img;
+        let own: FxHashMap<NameId, usize> = (self.module.consts.iter().map(|c| c.name))
+            .zip(0..)
+            .collect();
+        let mut exported = FxHashMap::default();
+        for info in img.array(img.field(img.public, 2)?)? {
+            if img.safety(info)? != Safety::Safe {
+                continue;
+            }
+            let cv = img.field(img.field(info, 0)?, 0)?;
+            let name = self.name(img.field(cv, 0)?)?;
+            let Some(&i) = own.get(&name) else { continue };
+            let ty = self.expr(img.field(cv, 2)?)?;
+            let k = &self.module.consts[i];
+            if ty != k.ty {
+                return Err(corrupt("a constant is exported at another type"));
+            }
+            let hidden = img.tag(info)? == AXIOM && !matches!(k.kind, Kind::Axiom);
+            exported.insert(name, hidden);
+        }
+        self.module.exported = Some(exported);
         Ok(())
     }
 

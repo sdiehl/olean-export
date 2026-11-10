@@ -34,23 +34,41 @@ pub fn meta(bytes: &[u8]) -> Result<Value> {
     Ok(serde_json::from_str(&json)?)
 }
 
-/// A per-module file's module name and its imports with their blake3 hashes.
-fn module(meta: &Value) -> Result<(String, Vec<(String, String)>)> {
+/// A per-module file's `meta`.
+struct Module {
+    name: String,
+    imports: Vec<(String, String)>,
+    interface: Option<String>,
+    public: bool,
+    inside: Vec<String>,
+}
+
+fn module(meta: &Value) -> Result<Module> {
     let m = meta
         .get("module")
         .ok_or_else(|| corrupt("not a per-module export"))?;
     let s = |v: &Value| v.as_str().map(str::to_owned);
     let bad = || corrupt("bad module in meta");
-    let name = m.get("name").and_then(s).ok_or_else(bad)?;
-    let imports = m
-        .get("imports")
-        .and_then(Value::as_array)
-        .ok_or_else(bad)?
-        .iter()
-        .map(|i| Some((s(i.get("name")?)?, s(i.get("blake3")?)?)))
-        .collect::<Option<_>>()
-        .ok_or_else(bad)?;
-    Ok((name, imports))
+    Ok(Module {
+        name: m.get("name").and_then(s).ok_or_else(bad)?,
+        imports: m
+            .get("imports")
+            .and_then(Value::as_array)
+            .ok_or_else(bad)?
+            .iter()
+            .map(|i| Some((s(i.get("name")?)?, s(i.get("blake3")?)?)))
+            .collect::<Option<_>>()
+            .ok_or_else(bad)?,
+        interface: m.get("interface").and_then(s),
+        public: m.get("public").and_then(Value::as_bool) == Some(true),
+        inside: (m
+            .get("inside")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten())
+        .filter_map(s)
+        .collect(),
+    })
 }
 
 /// Hex blake3 of an export's bytes, as per-module metas name their imports.
@@ -60,42 +78,95 @@ pub fn hash(bytes: &[u8]) -> String {
 }
 
 /// The order to join per-module `files` in, imports first. Fails unless every import of
-/// every file is among them with the hash it was exported against.
+/// every file is among them with the hash it was exported against, or is the module whose
+/// interface has that hash.
 pub fn order(files: &[&[u8]]) -> Result<Vec<usize>> {
+    plan(files, None)
+}
+
+/// The files to join for `root` as Lean showed it its imports, imports first.
+pub fn view(files: &[&[u8]], root: &str) -> Result<Vec<usize>> {
+    plan(files, Some(root))
+}
+
+fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
     let mods = files
         .iter()
         .map(|b| module(&meta(b)?))
         .collect::<Result<Vec<_>>>()?;
-    let mut by_name = FxHashMap::default();
-    for (i, (n, _)) in mods.iter().enumerate() {
-        if by_name.insert(n.as_str(), i).is_some() {
-            return Err(corrupt(format!("module {n} given twice")));
+    let mut by_name: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    for (i, m) in mods.iter().enumerate() {
+        let given = by_name.entry(m.name.as_str()).or_default();
+        if root.is_none() && !given.is_empty() {
+            return Err(corrupt(format!("module {} given twice", m.name)));
         }
+        given.push(i);
     }
     let hashes: Vec<String> = files.iter().map(|b| hash(b)).collect();
+    let start = root
+        .map(|r| {
+            (by_name.get(r).into_iter().flatten().copied())
+                .find(|&j| !mods[j].public)
+                .ok_or_else(|| corrupt(format!("module {r} is not given")))
+        })
+        .transpose()?;
+    // a root outside the module system sees all of every module under it
+    let whole = start.is_none_or(|j| mods[j].interface.is_none());
     let mut deps = Vec::with_capacity(files.len());
-    for (n, imports) in &mods {
+    for m in &mods {
         let mut d = Vec::new();
-        for (i, h) in imports {
-            let &j = by_name
+        for (i, h) in &m.imports {
+            let given = by_name
                 .get(i.as_str())
-                .ok_or_else(|| corrupt(format!("{n} imports {i}, which is not given")))?;
-            if hashes[j] != *h {
-                return Err(corrupt(format!("{n} was exported against another {i}")));
-            }
-            d.push(j);
+                .ok_or_else(|| corrupt(format!("{} imports {i}, which is not given", m.name)))?;
+            let of = |j: usize| mods[j].interface.as_ref() == Some(h);
+            let found = (given.iter().copied())
+                .filter(|&j| hashes[j] == *h || whole && of(j))
+                .min_by_key(|&j| mods[j].public);
+            d.push(found.ok_or_else(|| {
+                corrupt(if given.iter().any(|&j| of(j)) {
+                    format!(
+                        "{} imports the interface of {i}, which is not given",
+                        m.name
+                    )
+                } else {
+                    format!("{} was exported against another {i}", m.name)
+                })
+            })?);
         }
         deps.push(d);
     }
+    if let Some(start) = start {
+        let mut seen = vec![false; files.len()];
+        let mut stack = vec![start];
+        while let Some(i) = stack.pop() {
+            if !std::mem::replace(&mut seen[i], true) {
+                stack.extend(&deps[i]);
+            }
+        }
+        let reached: FxHashMap<&str, usize> = (0..files.len())
+            .filter(|&i| seen[i] && !mods[i].public)
+            .map(|i| (mods[i].name.as_str(), i))
+            .collect();
+        for d in deps.iter_mut().flatten() {
+            *d = *reached.get(mods[*d].name.as_str()).unwrap_or(d);
+        }
+        // the first copy of a declaration wins, so a module joined whole goes before an
+        // interface that states its constants as axioms
+        for (i, m) in mods.iter().enumerate() {
+            deps[i].extend(m.inside.iter().filter_map(|o| reached.get(o.as_str())));
+        }
+    }
+    let starts = start.map_or_else(|| (0..files.len()).collect(), |s| vec![s]);
     let mut out = Vec::with_capacity(files.len());
     let mut state = vec![0u8; files.len()];
-    for root in 0..files.len() {
+    for root in starts {
         let mut stack = vec![(root, 0)];
         while let Some((i, k)) = stack.pop() {
             if k == 0 {
                 match state[i] {
                     2 => continue,
-                    1 => return Err(corrupt(format!("import cycle at {}", mods[i].0))),
+                    1 => return Err(corrupt(format!("import cycle at {}", mods[i].name))),
                     _ => state[i] = 1,
                 }
             }
@@ -186,8 +257,16 @@ impl<S: Sink> Sink for &mut Shift<'_, S> {
 /// Join per-module `files` into one export on `sink`, in the order [`order`] gives. Names,
 /// levels and expressions two modules share appear once per module, a declaration two
 /// modules make appears once.
-pub fn join<S: Sink>(files: &[&[u8]], mut sink: S) -> Result<S::Output> {
-    let order = order(files)?;
+pub fn join<S: Sink>(files: &[&[u8]], sink: S) -> Result<S::Output> {
+    merge(files, order(files)?, sink)
+}
+
+/// Join the files [`view`] picks for `root`.
+pub fn join_view<S: Sink>(files: &[&[u8]], root: &str, sink: S) -> Result<S::Output> {
+    merge(files, view(files, root)?, sink)
+}
+
+fn merge<S: Sink>(files: &[&[u8]], order: Vec<usize>, mut sink: S) -> Result<S::Output> {
     let Some(&first) = order.first() else {
         return Err(corrupt("nothing to join"));
     };
@@ -245,10 +324,20 @@ type Out = Hashing<BufWriter<File>>;
 /// refers to its imports' constants by name, so joining the files gives a whole export,
 /// up to numbering and order, plus the internal constants nothing needs. Returns the files in module order.
 pub fn split(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
+    split_as(env, dir, blean, false)
+}
+
+/// Like [`split`], with each module written against what the module system shows it and
+/// its interface in `dir/public`.
+pub fn split_interfaces(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
+    split_as(env, dir, blean, true)
+}
+
+fn split_as(env: &Env, dir: &Path, blean: bool, interfaces: bool) -> Result<Vec<PathBuf>> {
     if blean {
-        split_with(env, dir, "blean", Blean::new)
+        split_with(env, dir, "blean", interfaces, Blean::new)
     } else {
-        split_with(env, dir, "ndjson", Ndjson::new)
+        split_with(env, dir, "ndjson", interfaces, Ndjson::new)
     }
 }
 
@@ -256,13 +345,22 @@ fn split_with<S: Sink<Output = Out>>(
     env: &Env,
     dir: &Path,
     ext: &str,
+    interfaces: bool,
     sink: impl Fn(Out) -> S,
 ) -> Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(dir)?;
+    let public = dir.join("public");
+    std::fs::create_dir_all(if interfaces { &public } else { dir })?;
     let paths: Vec<PathBuf> = env
         .modules
         .iter()
         .map(|m| dir.join(format!("{m}.{ext}")))
+        .collect();
+    let files: Vec<(usize, bool, PathBuf)> = (0..paths.len())
+        .flat_map(|m| {
+            let shown = (interfaces && env.exported[m].is_some())
+                .then(|| (m, true, public.join(format!("{}.{ext}", env.modules[m]))));
+            shown.into_iter().chain([(m, false, paths[m].clone())])
+        })
         .collect();
     let open = |p: &Path| -> Result<S> {
         Ok(sink(Hashing {
@@ -270,7 +368,7 @@ fn split_with<S: Sink<Output = Out>>(
             hash: blake3::Hasher::new(),
         }))
     };
-    let Some(first) = paths.first() else {
+    let Some((_, _, first)) = files.first() else {
         return Ok(paths);
     };
     let index: FxHashMap<&str, usize> = env
@@ -279,29 +377,59 @@ fn split_with<S: Sink<Output = Out>>(
         .enumerate()
         .map(|(i, m)| (m.as_str(), i))
         .collect();
-    let mut hashes: Vec<String> = Vec::with_capacity(paths.len());
-    let mut ex = Exporter::per_module(env, open(first)?);
-    for m in 0..paths.len() {
+    let mut whole: Vec<String> = Vec::with_capacity(paths.len());
+    let mut shown: Vec<Option<String>> = vec![None; paths.len()];
+    let mut ex = if interfaces {
+        Exporter::restricted(env, open(first)?)
+    } else {
+        Exporter::per_module(env, open(first)?)
+    };
+    for (k, (m, interface, _)) in files.iter().enumerate() {
+        let (m, name) = (*m, &env.modules[*m]);
+        let module = interfaces && env.exported[m].is_some();
         let imports = env.imports[m]
             .iter()
+            .filter(|i| !interface || i.exported)
             .map(|i| {
-                let h = index
-                    .get(i.as_str())
-                    .and_then(|&j| hashes.get(j))
-                    .ok_or_else(|| corrupt(format!("{} imports unloaded {i}", env.modules[m])))?;
-                Ok(serde_json::json!({"name": i, "blake3": h}))
+                let j = (index.get(i.module.as_str()).copied())
+                    .filter(|&j| j < whole.len())
+                    .ok_or_else(|| corrupt(format!("{name} imports unloaded {}", i.module)))?;
+                let seen = shown[j]
+                    .as_ref()
+                    .filter(|_| module && (*interface || !i.all));
+                Ok(serde_json::json!({
+                    "name": i.module,
+                    "blake3": seen.unwrap_or(&whole[j]),
+                    "all": i.all,
+                    "public": i.exported,
+                    "meta": i.meta,
+                }))
             })
             .collect::<Result<Vec<_>>>()?;
-        ex.meta_with(Some(
-            serde_json::json!({"name": env.modules[m], "imports": imports}),
-        ))?;
-        ex.module(m)?;
-        if m + 1 == paths.len() {
-            break;
+        let mut meta = serde_json::json!({"name": name, "imports": imports});
+        if *interface {
+            meta["public"] = true.into();
+            meta["inside"] = ex.inside(m).map(|o| env.modules[o].as_str()).collect();
+            ex.meta_with(Some(meta))?;
+            ex.interface(m)?;
+        } else {
+            if let Some(h) = &shown[m] {
+                meta["interface"] = h.as_str().into();
+            }
+            ex.meta_with(Some(meta))?;
+            ex.module(m)?;
         }
-        let mut out = ex.split(open(&paths[m + 1])?)?;
+        let Some((_, _, next)) = files.get(k + 1) else {
+            break;
+        };
+        let mut out = ex.split(open(next)?)?;
         out.flush()?;
-        hashes.push(out.hash.finalize().to_hex().to_string());
+        let h = out.hash.finalize().to_hex().to_string();
+        if *interface {
+            shown[m] = Some(h);
+        } else {
+            whole.push(h);
+        }
     }
     ex.finish()?.flush()?;
     Ok(paths)

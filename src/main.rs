@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use olean_export::{
     blean::{self, Blean},
+    join::{join_view, split, split_interfaces},
     key::Keys,
     ndjson::{self, Ndjson},
     resolve, search_path, statement, Env, Exporter, NameId, Sink, Summary,
@@ -62,6 +63,10 @@ struct Cli {
     /// Write each module to its own file in DIR
     #[arg(long, value_name = "DIR", conflicts_with_all = ["output", "consts"])]
     per_module: Option<PathBuf>,
+    /// With --per-module, write each module against what the module system shows it,
+    /// and its public interface to DIR/public
+    #[arg(long, requires = "per_module")]
+    interfaces: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -125,6 +130,9 @@ enum Command {
         /// Per-module NDJSON or blean exports
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Join only MODULE and what the module system shows it, from --interfaces exports
+        #[arg(short, long, value_name = "MODULE")]
+        module: Option<String>,
         /// Write to FILE instead of stdout
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
@@ -174,9 +182,10 @@ fn main() -> ExitCode {
         Some(Command::Compare { a, b, limit }) => compare(a, b, *limit),
         Some(Command::Join {
             files,
+            module,
             output,
             format,
-        }) => join(files, output.as_ref(), *format),
+        }) => join(files, module.as_deref(), output.as_ref(), *format),
         Some(Command::Keys { input }) => keys(input),
         Some(Command::Accepted { file }) => accepted(file),
         Some(Command::Statement {
@@ -345,6 +354,24 @@ fn inspect(cli: &Cli, target: &str, list: bool) -> Res {
     Ok(())
 }
 
+fn per_module(cli: &Cli, env: &Env, dir: &std::path::Path, start: Instant) -> Res {
+    let split = if cli.interfaces {
+        split_interfaces
+    } else {
+        split
+    };
+    let files = split(env, dir, cli.format == Format::Blean)?;
+    if !cli.quiet {
+        eprintln!(
+            "{} modules written to {} in {:.2}s",
+            HumanCount(files.len() as u64),
+            dir.display(),
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 fn run(cli: &Cli) -> Res {
     let start = Instant::now();
     let search = search(cli)?;
@@ -375,16 +402,7 @@ fn run(cli: &Cli) -> Res {
     let loaded = start.elapsed();
 
     if let Some(dir) = &cli.per_module {
-        let files = olean_export::join::split(&env, dir, cli.format == Format::Blean)?;
-        if !cli.quiet {
-            eprintln!(
-                "{} modules written to {} in {:.2}s",
-                HumanCount(files.len() as u64),
-                dir.display(),
-                start.elapsed().as_secs_f64()
-            );
-        }
-        return Ok(());
+        return per_module(cli, &env, dir, start);
     }
 
     let targets = if cli.consts.is_empty() {
@@ -588,13 +606,20 @@ fn out(output: Option<&PathBuf>) -> io::Result<BufWriter<Box<dyn Write>>> {
     Ok(BufWriter::with_capacity(1 << 20, sink))
 }
 
-fn join(files: &[PathBuf], output: Option<&PathBuf>, format: Format) -> Res {
+fn join(files: &[PathBuf], module: Option<&str>, output: Option<&PathBuf>, format: Format) -> Res {
+    use olean_export::join::join;
     let maps = files.iter().map(mmap).collect::<io::Result<Vec<_>>>()?;
     let bytes: Vec<&[u8]> = maps.iter().map(|m| &m[..]).collect();
     let out = out(output)?;
     let mut out = match format {
-        Format::Ndjson => olean_export::join::join(&bytes, Ndjson::new(out))?,
-        Format::Blean => olean_export::join::join(&bytes, Blean::new(out))?,
+        Format::Ndjson => match module {
+            Some(m) => join_view(&bytes, m, Ndjson::new(out))?,
+            None => join(&bytes, Ndjson::new(out))?,
+        },
+        Format::Blean => match module {
+            Some(m) => join_view(&bytes, m, Blean::new(out))?,
+            None => join(&bytes, Blean::new(out))?,
+        },
     };
     out.flush()?;
     Ok(())

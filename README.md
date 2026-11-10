@@ -1,10 +1,15 @@
 # olean-export
 
-Rust library for reading and manipulating `.olean` files directly in Rust and emit the [lean4export](https://github.com/leanprover/lean4export) NDJSON stream for external kernel checkers without using Lean compiler directly.
+A Rust swiss army knife for reading and manipulating `.olean` files, usable from the CLI or inside Rust kernels, without running Lean.
 
-Mostly designed around the ideas of having efficient external binary formats, doing incremental and transitive-cone checking.
-
-The big idea is an `.olean` is already a compacted heap image of `lean.h` objects, so the reader walks those objects, hash-conses names, levels and expressions, and writes the same records lean4export would, in dependency order. But much faster.
+- Emits [lean4export](https://github.com/leanprover/lean4export) NDJSON, much faster
+- BLean, a compact binary export format
+- Cone export of chosen constants
+- Statement cones, a theorem's proof-free trusted base
+- Per-module exports pinned by hash, with `join`
+- Modular checking with module-system-restricted imports
+- Closure keys and accepted store for incremental checking
+- `inspect` and `compare` for oleans and exports
 
 The object layout is tied to the Lean release. This version reads olean format v2 as written by Lean 4.26 through 4.35, and refuses files from any other release.
 
@@ -71,6 +76,13 @@ lake env olean-export statement FLT -c THEOREM --trust Init,Std,Lean,Mathlib
 ```bash
 lake env olean-export Mathlib --per-module out/
 olean-export join out/*.ndjson -o mathlib.ndjson
+```
+
+`--interfaces` gives modular checking with module-system-restricted imports. Each module is written against what Lean showed it, with its exports in `out/public/`, and `join -m` gives one module over its imports' interfaces.
+
+```bash
+lake env olean-export Std --per-module out/ --interfaces
+olean-export join -m Std.Data.HashMap.Lemmas out/*.ndjson out/public/*.ndjson -o view.ndjson
 ```
 
 ## Inspect

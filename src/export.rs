@@ -68,12 +68,18 @@ pub struct Exporter<'a, S: Sink> {
 /// needs them, and the environment keeps one copy, which may refer to private constants of
 /// a module the writer does not import. So a file holds what its module declares and
 /// whatever else it needs that no import provides.
+///
+/// Per module: `whole` are the modules it sees all of, `shown` those it sees the exports
+/// of, `public` those its own interface may refer to.
 #[derive(Debug, Default)]
 struct Scope {
     owner: FxHashMap<NameId, u32>,
     more: FxHashMap<NameId, Vec<u32>>,
-    closure: Vec<Vec<u64>>,
+    whole: Vec<Vec<u64>>,
+    shown: Vec<Vec<u64>>,
+    public: Vec<Vec<u64>>,
     module: u32,
+    interface: bool,
     names: Vec<NameId>,
     levels: Vec<LevelId>,
     exprs: Vec<ExprId>,
@@ -81,8 +87,17 @@ struct Scope {
     visited: Vec<NameId>,
 }
 
+fn has(bits: &[u64], i: usize) -> bool {
+    bits[i / 64] >> (i % 64) & 1 == 1
+}
+
+fn add(bits: &mut [u64], more: &[u64], i: usize) {
+    bits.iter_mut().zip(more).for_each(|(b, m)| *b |= m);
+    bits[i / 64] |= 1 << (i % 64);
+}
+
 impl Scope {
-    fn new(env: &Env) -> Self {
+    fn new(env: &Env, restricted: bool) -> Self {
         let mut s = Self::default();
         for m in 0..env.modules.len() {
             let m32 = u32::try_from(m).expect("module count");
@@ -103,32 +118,52 @@ impl Scope {
             .map(|(i, m)| (m.as_str(), i))
             .collect();
         let words = env.modules.len().div_ceil(64);
-        for imports in &env.imports {
-            let mut bits = vec![0u64; words];
-            for &j in imports.iter().filter_map(|i| index.get(i.as_str())) {
-                if let Some(c) = s.closure.get(j) {
-                    bits.iter_mut().zip(c).for_each(|(b, c)| *b |= c);
-                    bits[j / 64] |= 1 << (j % 64);
+        let mut under: Vec<Vec<u64>> = Vec::new();
+        for (m, imports) in env.imports.iter().enumerate() {
+            let module = restricted && env.exported[m].is_some();
+            let [mut all, mut whole, mut shown, mut public] = [(); 4].map(|()| vec![0u64; words]);
+            for i in imports {
+                let Some(&j) = index.get(i.module.as_str()).filter(|&&j| j < m) else {
+                    continue;
+                };
+                add(&mut all, &under[j], j);
+                if module && i.all {
+                    add(&mut whole, &s.whole[j], j);
+                    shown.iter_mut().zip(&s.shown[j]).for_each(|(b, m)| *b |= m);
+                } else if module {
+                    add(&mut shown, &s.public[j], j);
+                }
+                if i.exported {
+                    add(&mut public, &s.public[j], j);
                 }
             }
-            s.closure.push(bits);
+            s.whole.push(if module { whole } else { all.clone() });
+            s.shown.push(shown);
+            s.public.push(public);
+            under.push(all);
         }
         s
     }
 
-    /// Whether the module being written writes `c`, rather than an import providing it.
-    fn writes(&self, c: NameId) -> bool {
+    /// Whether the file being written writes `c`, rather than an import providing it.
+    fn writes(&self, env: &Env, c: NameId) -> bool {
         let Some(&first) = self.owner.get(&c) else {
             return true;
         };
         let owners = std::iter::once(first).chain(self.more.get(&c).into_iter().flatten().copied());
+        let m = self.module as usize;
         let mut provided = false;
         for o in owners {
             if o == self.module {
                 return true;
             }
-            let bits = &self.closure[self.module as usize];
-            provided |= bits[o as usize / 64] >> (o % 64) & 1 == 1;
+            let o = o as usize;
+            let shows = || env.exported[o].as_ref().is_none_or(|e| e.contains_key(&c));
+            provided |= if self.interface {
+                has(&self.public[m], o) && shows()
+            } else {
+                has(&self.whole[m], o) || has(&self.shown[m], o) && shows()
+            };
         }
         !provided
     }
@@ -186,22 +221,70 @@ impl<'a, S: Sink> Exporter<'a, S> {
     /// declare by name only.
     pub fn per_module(env: &'a Env, sink: S) -> Self {
         let mut ex = Self::with_sink(env, sink);
-        ex.scope = Some(Box::new(Scope::new(env)));
+        ex.scope = Some(Box::new(Scope::new(env, false)));
+        ex
+    }
+
+    /// Like [`Exporter::per_module`], but an import provides only what Lean showed of it.
+    pub fn restricted(env: &'a Env, sink: S) -> Self {
+        let mut ex = Self::with_sink(env, sink);
+        ex.scope = Some(Box::new(Scope::new(env, true)));
         ex
     }
 
     /// Write every constant module `m` declares. Internal ones are included, since a later
     /// module may need them.
     pub fn module(&mut self, m: usize) -> Result<()> {
+        self.enter(m, false)?;
+        let env = self.env;
+        env.module_consts(m)
+            .iter()
+            .try_for_each(|&c| self.constant(c))
+    }
+
+    /// Write what module `m` exports.
+    pub fn interface(&mut self, m: usize) -> Result<()> {
+        self.enter(m, true)?;
+        let env = self.env;
+        let shown = env.exported[m].as_ref();
+        env.module_consts(m)
+            .iter()
+            .filter(|c| shown.is_none_or(|e| e.contains_key(c)))
+            .try_for_each(|&c| self.constant(c))
+    }
+
+    fn enter(&mut self, m: usize, interface: bool) -> Result<()> {
         let s = self
             .scope
             .as_mut()
             .ok_or(Error::Misuse("module needs a per-module exporter"))?;
         s.module = u32::try_from(m).expect("module count");
-        let env = self.env;
-        env.module_consts(m)
-            .iter()
-            .try_for_each(|&c| self.constant(c))
+        s.interface = interface;
+        Ok(())
+    }
+
+    /// The modules `m` sees all of.
+    pub fn inside(&self, m: usize) -> impl Iterator<Item = usize> + '_ {
+        let whole = self.scope.as_ref().map(|s| &s.whole[m]);
+        (0..self.env.modules.len()).filter(move |&o| whole.is_some_and(|w| has(w, o)))
+    }
+
+    /// Whether an interface states `k` as an axiom. Every theorem is, since Lean exports
+    /// some with a proof that rests on a hidden body, and so is any definition whose body
+    /// is not exported, including one an exported statement mentions but no module shows.
+    fn hidden(&self, k: &Const) -> bool {
+        let Some(s) = self.scope.as_ref().filter(|s| s.interface) else {
+            return false;
+        };
+        match k.kind {
+            Kind::Thm(_) => true,
+            Kind::Defn(_) | Kind::Opaque(_) => {
+                let owner = s.owner.get(&k.name).map(|&o| o as usize);
+                let shown = owner.and_then(|o| self.env.exported[o].as_ref());
+                shown.is_some_and(|e| e.get(&k.name) != Some(&false))
+            }
+            _ => false,
+        }
     }
 
     /// End the current file and start the next on `sink`, with ids from the start again.
@@ -502,7 +585,7 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     }
                 }
                 Task::Const(c) => {
-                    if self.scope.as_ref().is_some_and(|s| !s.writes(c)) {
+                    if self.scope.as_ref().is_some_and(|s| !s.writes(env, c)) {
                         continue;
                     }
                     if !self.visit(c) {
@@ -513,6 +596,10 @@ impl<'a, S: Sink> Exporter<'a, S> {
                     };
                     if !matches!(k.kind, Kind::Ctor(_) | Kind::Rec(_)) {
                         work.push(Task::Emit(c));
+                    }
+                    if self.hidden(k) {
+                        work.push(Task::Scan(k.ty));
+                        continue;
                     }
                     let at = work.len();
                     let mut unloaded = None;
@@ -552,22 +639,9 @@ impl<'a, S: Sink> Exporter<'a, S> {
     fn write(&mut self, c: NameId) -> Result<()> {
         let k = &self.env.consts[&c];
         match &k.kind {
-            Kind::Thm(_) if self.depth == Depth::Statements => {
-                let head = self.header(k)?;
-                self.decl(Decl::Axiom {
-                    head,
-                    is_unsafe: false,
-                    all: None,
-                })
-            }
-            Kind::Axiom => {
-                let head = self.header(k)?;
-                self.decl(Decl::Axiom {
-                    head,
-                    is_unsafe: false,
-                    all: None,
-                })
-            }
+            Kind::Thm(_) if self.depth == Depth::Statements => self.axiom(k),
+            _ if self.hidden(k) => self.axiom(k),
+            Kind::Axiom => self.axiom(k),
             Kind::Defn(d) => {
                 let head = self.header(k)?;
                 let value = self.expr(d.value)?;
@@ -601,6 +675,15 @@ impl<'a, S: Sink> Exporter<'a, S> {
             Kind::Induct(ind) => self.inductive(k, ind),
             Kind::Ctor(_) | Kind::Rec(_) => unreachable!("exported through their inductive"),
         }
+    }
+
+    fn axiom(&mut self, k: &Const) -> Result<()> {
+        let head = self.header(k)?;
+        self.decl(Decl::Axiom {
+            head,
+            is_unsafe: false,
+            all: None,
+        })
     }
 
     fn header(&mut self, k: &Const) -> Result<Head> {

@@ -18,7 +18,7 @@ const KINDS: [&str; 8] = [
     "recursor",
 ];
 
-/// One entry of a module's import list.
+/// One entry of a module's import list: `import all`, `public import` and `meta import`.
 #[derive(Debug, Clone)]
 pub struct Import {
     pub module: String,
@@ -84,19 +84,10 @@ impl Summary {
             .collect();
 
         let field = |i| img.field(root, i);
-        let [imports, consts, extra, entries] =
+        let [imports_array, consts, extra, entries] =
             [0, 2, 3, 4].map(|i| field(i).and_then(|o| img.array(o)));
-        let imports: Vec<Import> = imports?
-            .into_iter()
-            .map(|i| {
-                Ok(Import {
-                    module: img.str_name(img.field(i, 0)?)?,
-                    all: img.scalar_u8(i, 0)? != 0,
-                    exported: img.scalar_u8(i, 1)? != 0,
-                    meta: img.scalar_u8(i, 2)? != 0,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let imports = img.imports()?;
+        drop(imports_array?);
         let consts: Vec<Decl> = consts?
             .into_iter()
             .map(|c| decl(&img, c))

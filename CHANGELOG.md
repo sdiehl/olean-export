@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add `--interfaces`, per-module exports that follow the module system.
+- Add `join -m MODULE`, one module over its imports' interfaces.
+- Per-module imports carry `all`, `public` and `meta`, so file hashes change.
+- `Env::imports` holds `inspect::Import`, and `Env::exported` what a module exports.
+
 ## 0.6.0 (2026-11-09)
 
 - Add `--per-module` exports and `join` to merge them.

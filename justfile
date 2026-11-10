@@ -19,6 +19,9 @@ fixtures toolchain="leanprover/lean4:v4.35.0-rc3":
     for m in Base $(ls *.lean | sed 's/\.lean$//' | grep -vx Base); do
         LEAN_PATH=build lean -o build/$m.olean $m.lean
     done
+    for f in modules/*.lean; do
+        LEAN_PATH=build lean -o build/$(basename $f .lean).olean $f
+    done
     for f in edit/*.lean; do
         m=$(basename $f .lean)
         (cd edit && LEAN_PATH=../build lean -o ../build/edit/$m.olean $m.lean)

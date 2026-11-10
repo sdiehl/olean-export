@@ -49,6 +49,8 @@ pub(crate) struct Image {
     pub(crate) parts: Vec<Part>,
     pub(crate) header: Header,
     pub(crate) root: u64,
+    /// The root of the first part, which lists what the module exports.
+    pub(crate) public: u64,
 }
 
 /// The Lean releases whose object layouts this reader has been checked against.
@@ -64,6 +66,7 @@ impl Image {
             parts: Vec::new(),
             header: Header::default(),
             root: 0,
+            public: 0,
         };
         img.push_part(path)?;
         Ok(img)
@@ -118,6 +121,9 @@ impl Image {
         };
         let base = le64(&bytes[80..88]);
         self.root = le64(&bytes[88..96]);
+        if self.parts.is_empty() {
+            self.public = self.root;
+        }
         let slot = self.slots();
         self.parts.push(Part { base, slot, bytes });
         Ok(())

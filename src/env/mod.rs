@@ -19,6 +19,7 @@ use self::{
 };
 use crate::{
     error::{at, Error, Result},
+    inspect::Import,
     olean::{Header, Image},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -43,7 +44,9 @@ pub struct Env {
     pub recursors: FxHashMap<NameId, Vec<NameId>>,
     pub modules: Vec<String>,
     /// The direct imports of each module in `modules`.
-    pub imports: Vec<Vec<String>>,
+    pub imports: Vec<Vec<Import>>,
+    /// What each module in the module system exports, true where only the statement.
+    pub exported: Vec<Option<FxHashMap<NameId, bool>>>,
     pub header: Header,
     pub skipped: usize,
     /// Where each module's constants end in `order`.
@@ -116,7 +119,7 @@ fn discover(
     let imports = img.imports().map_err(at(&path))?;
     drop(img);
     for import in &imports {
-        discover(search, import, seen, out)?;
+        discover(search, &import.module, seen, out)?;
     }
     out.push((module.to_owned(), path));
     Ok(())
@@ -198,6 +201,7 @@ impl Env {
             recursors: FxHashMap::default(),
             modules: Vec::new(),
             imports: Vec::new(),
+            exported: Vec::new(),
             header: Header::default(),
             skipped: 0,
             ends: Vec::new(),
@@ -237,6 +241,7 @@ impl Env {
             skipped: m.skipped,
             header: m.header,
             imports: m.imports,
+            exported: m.exported,
             pending: m.pending,
         }
     }
@@ -259,6 +264,7 @@ impl Env {
         }
         self.modules = loaded.iter().map(|l| l.module.clone()).collect();
         self.imports = loaded.iter().map(|l| l.imports.clone()).collect();
+        self.exported = loaded.iter().map(|l| l.exported.clone()).collect();
         self.header = loaded.last().map(|l| l.header.clone()).unwrap_or_default();
         self.skipped = loaded.iter().map(|l| l.skipped).sum();
         self.ends = loaded

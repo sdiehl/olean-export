@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
+    inspect::Import,
     olean::Header,
 };
 use hashbrown::HashTable;
@@ -40,7 +41,8 @@ pub(super) struct Loaded {
     pub(super) recursors: FxHashMap<NameId, Vec<NameId>>,
     pub(super) skipped: usize,
     pub(super) header: Header,
-    pub(super) imports: Vec<String>,
+    pub(super) imports: Vec<Import>,
+    pub(super) exported: Option<FxHashMap<NameId, bool>>,
     pub(super) pending: Vec<(NameId, u64)>,
 }
 
