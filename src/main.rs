@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{HumanBytes, HumanCount, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use olean_export::{
     blean::{self, Blean},
-    join::{join_view, split, split_interfaces},
+    join::{join_in, meta, order, split_each, view},
     key::Keys,
     ndjson::{self, Ndjson},
     resolve, search_path, statement, Env, Exporter, NameId, Sink, Summary,
@@ -14,7 +14,7 @@ use std::{
     fs::File,
     io::{self, BufWriter, Write},
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     rc::Rc,
     thread,
@@ -354,13 +354,19 @@ fn inspect(cli: &Cli, target: &str, list: bool) -> Res {
     Ok(())
 }
 
-fn per_module(cli: &Cli, env: &Env, dir: &std::path::Path, start: Instant) -> Res {
-    let split = if cli.interfaces {
-        split_interfaces
-    } else {
-        split
-    };
-    let files = split(env, dir, cli.format == Format::Blean)?;
+fn per_module(cli: &Cli, env: &Env, dir: &Path, start: Instant) -> Res {
+    let written = env
+        .exported
+        .iter()
+        .filter(|e| cli.interfaces && e.is_some());
+    let pb = bar(
+        cli.quiet,
+        Some((env.modules.len() + written.count()) as u64),
+        "{spinner:.cyan} writing [{elapsed}] [{bar:30.cyan/blue}] {human_pos}/{human_len} files",
+    );
+    let blean = cli.format == Format::Blean;
+    let files = split_each(env, dir, blean, cli.interfaces, &|| pb.inc(1))?;
+    pb.finish_and_clear();
     if !cli.quiet {
         eprintln!(
             "{} modules written to {} in {:.2}s",
@@ -606,40 +612,56 @@ fn out(output: Option<&PathBuf>) -> io::Result<BufWriter<Box<dyn Write>>> {
     Ok(BufWriter::with_capacity(1 << 20, sink))
 }
 
-fn join(files: &[PathBuf], module: Option<&str>, output: Option<&PathBuf>, format: Format) -> Res {
-    use olean_export::join::join;
-    let mut paths = Vec::new();
-    for f in files {
-        if !f.is_dir() {
-            paths.push(f.clone());
+/// The files under `root` in a `--per-module` directory, found by name so the rest stay unopened.
+fn cone(dir: &Path, root: &str, maps: &mut Vec<memmap2::Mmap>) -> Res {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root.to_owned()];
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) {
             continue;
         }
-        // interfaces only matter to a view, and a whole join would see each module twice
-        let public = module.map(|_| f.join("public"));
-        for d in std::iter::once(f.clone()).chain(public) {
-            let Ok(entries) = std::fs::read_dir(d) else {
-                continue;
-            };
-            for e in entries {
-                let p = e?.path();
-                if p.extension().is_some_and(|x| x == "ndjson" || x == "blean") {
-                    paths.push(p);
+        for d in [dir.to_path_buf(), dir.join("public")] {
+            for ext in ["blean", "ndjson"] {
+                let p = d.join(format!("{n}.{ext}"));
+                if !p.is_file() {
+                    continue;
+                }
+                let map = mmap(&p)?;
+                let imports = &meta(&map)?["module"]["imports"];
+                let names = imports.as_array().into_iter().flatten();
+                stack.extend(names.filter_map(|i| Some(i["name"].as_str()?.to_owned())));
+                maps.push(map);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn join(files: &[PathBuf], module: Option<&str>, output: Option<&PathBuf>, format: Format) -> Res {
+    let mut maps = Vec::new();
+    for f in files {
+        match module {
+            _ if !f.is_dir() => maps.push(mmap(f)?),
+            Some(m) => cone(f, m, &mut maps)?,
+            None => {
+                for e in std::fs::read_dir(f)? {
+                    let p = e?.path();
+                    if p.extension().is_some_and(|x| x == "ndjson" || x == "blean") {
+                        maps.push(mmap(&p)?);
+                    }
                 }
             }
         }
     }
-    let maps = paths.iter().map(mmap).collect::<io::Result<Vec<_>>>()?;
     let bytes: Vec<&[u8]> = maps.iter().map(|m| &m[..]).collect();
+    let order = match module {
+        Some(m) => view(&bytes, m)?,
+        None => order(&bytes)?,
+    };
     let out = out(output)?;
     let mut out = match format {
-        Format::Ndjson => match module {
-            Some(m) => join_view(&bytes, m, Ndjson::new(out))?,
-            None => join(&bytes, Ndjson::new(out))?,
-        },
-        Format::Blean => match module {
-            Some(m) => join_view(&bytes, m, Blean::new(out))?,
-            None => join(&bytes, Blean::new(out))?,
-        },
+        Format::Ndjson => join_in(&bytes, &order, module, Ndjson::new(out))?,
+        Format::Blean => join_in(&bytes, &order, module, Blean::new(out))?,
     };
     out.flush()?;
     Ok(())

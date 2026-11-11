@@ -6,6 +6,8 @@
 - Add `join -m MODULE`, one module over its imports' interfaces.
 - A view's meta marks where imported declarations end, in `view.imported`.
 - `join` takes a `--per-module` directory in place of its files.
+- `join -m` on a directory opens only the files under the module, and counts its imports in parallel.
+- `--per-module` shows progress while writing.
 - Per-module imports carry `all`, `public` and `meta`, so file hashes change.
 - `Env::imports` holds `inspect::Import`, and `Env::exported` what a module exports.
 

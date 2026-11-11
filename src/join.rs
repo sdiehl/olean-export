@@ -7,9 +7,11 @@ use crate::{
     record::{Counts, Record, Sink, Table},
     Env, Exporter,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use std::{
+    cell::OnceCell,
     fs::File,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -91,7 +93,7 @@ pub fn view(files: &[&[u8]], root: &str) -> Result<Vec<usize>> {
 
 fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
     let mods = files
-        .iter()
+        .par_iter()
         .map(|b| module(&meta(b)?))
         .collect::<Result<Vec<_>>>()?;
     let mut by_name: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
@@ -102,7 +104,9 @@ fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
         }
         given.push(i);
     }
-    let hashes: Vec<String> = files.iter().map(|b| hash(b)).collect();
+    // hashed on demand, a view only reads the files under its root
+    let hashes: Vec<OnceCell<String>> = vec![OnceCell::new(); files.len()];
+    let hashed = |j: usize| hashes[j].get_or_init(|| hash(files[j]));
     let start = root
         .map(|r| {
             (by_name.get(r).into_iter().flatten().copied())
@@ -112,8 +116,7 @@ fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
         .transpose()?;
     // a root outside the module system sees all of every module under it
     let whole = start.is_none_or(|j| mods[j].interface.is_none());
-    let mut deps = Vec::with_capacity(files.len());
-    for m in &mods {
+    let imports = |m: &Module| -> Result<Vec<usize>> {
         let mut d = Vec::new();
         for (i, h) in &m.imports {
             let given = by_name
@@ -121,7 +124,7 @@ fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
                 .ok_or_else(|| corrupt(format!("{} imports {i}, which is not given", m.name)))?;
             let of = |j: usize| mods[j].interface.as_ref() == Some(h);
             let found = (given.iter().copied())
-                .filter(|&j| hashes[j] == *h || whole && of(j))
+                .filter(|&j| hashed(j) == h || whole && of(j))
                 .min_by_key(|&j| mods[j].public);
             d.push(found.ok_or_else(|| {
                 corrupt(if given.iter().any(|&j| of(j)) {
@@ -134,16 +137,18 @@ fn plan(files: &[&[u8]], root: Option<&str>) -> Result<Vec<usize>> {
                 })
             })?);
         }
-        deps.push(d);
-    }
-    if let Some(start) = start {
-        let mut seen = vec![false; files.len()];
-        let mut stack = vec![start];
-        while let Some(i) = stack.pop() {
-            if !std::mem::replace(&mut seen[i], true) {
-                stack.extend(&deps[i]);
-            }
+        Ok(d)
+    };
+    let mut deps = vec![Vec::new(); files.len()];
+    let mut seen = vec![false; files.len()];
+    let mut stack = start.map_or_else(|| (0..files.len()).collect(), |s| vec![s]);
+    while let Some(i) = stack.pop() {
+        if !std::mem::replace(&mut seen[i], true) {
+            deps[i] = imports(&mods[i])?;
+            stack.extend(&deps[i]);
         }
+    }
+    if start.is_some() {
         let reached: FxHashMap<&str, usize> = (0..files.len())
             .filter(|&i| seen[i] && !mods[i].public)
             .map(|i| (mods[i].name.as_str(), i))
@@ -196,10 +201,7 @@ struct Shift<'s, S> {
 
 impl<S: Sink> Shift<'_, S> {
     fn name(&mut self, pre: u32, tag: u8, last: &[u8]) {
-        let mut b = self.names[pre as usize].to_le_bytes().to_vec();
-        b.push(tag);
-        b.extend_from_slice(last);
-        self.names.push(xxh3_128(&b));
+        self.names.push(named(self.names[pre as usize], tag, last));
     }
 
     const fn id(&self, t: Table, i: u32) -> u32 {
@@ -258,7 +260,7 @@ impl<S: Sink> Sink for &mut Shift<'_, S> {
 /// levels and expressions two modules share appear once per module, a declaration two
 /// modules make appears once.
 pub fn join<S: Sink>(files: &[&[u8]], sink: S) -> Result<S::Output> {
-    merge(files, &order(files)?, None, sink)
+    join_in(files, &order(files)?, None, sink)
 }
 
 /// Join the files [`view`] picks for `root`.
@@ -267,21 +269,77 @@ pub fn join<S: Sink>(files: &[&[u8]], sink: S) -> Result<S::Output> {
 /// checker may take those as given: Lean checks a statement where its module's imports
 /// unfold, not where an importer sees them hidden.
 pub fn join_view<S: Sink>(files: &[&[u8]], root: &str, sink: S) -> Result<S::Output> {
-    merge(files, &view(files, root)?, Some(root), sink)
+    join_in(files, &view(files, root)?, Some(root), sink)
 }
 
-struct Count(u64);
+fn named(pre: u128, tag: u8, last: &[u8]) -> u128 {
+    let mut b = pre.to_le_bytes().to_vec();
+    b.push(tag);
+    b.extend_from_slice(last);
+    xxh3_128(&b)
+}
 
-impl Sink for Count {
-    type Output = ();
+/// The name of each declaration in a file, hashed as [`Shift`] does.
+struct Declared {
+    names: Vec<u128>,
+    decls: Vec<Option<u128>>,
+}
+
+impl Sink for Declared {
+    type Output = Vec<Option<u128>>;
 
     fn record(&mut self, _: Option<u32>, r: &Record<'_>) -> Result<()> {
-        self.0 += u64::from(matches!(r, Record::Decl(_)));
+        match r {
+            Record::NameStr { pre, str } => {
+                let h = named(self.names[*pre as usize], 0, str.as_bytes());
+                self.names.push(h);
+            }
+            Record::NameNum { pre, i } => {
+                let h = named(self.names[*pre as usize], 1, &i.to_le_bytes());
+                self.names.push(h);
+            }
+            Record::Decl(d) => {
+                let n = d.name().and_then(|n| self.names.get(n as usize));
+                self.decls.push(n.copied());
+            }
+            _ => {}
+        }
         Ok(())
     }
 
-    fn finish(self) -> Result<()> {
-        Ok(())
+    fn finish(self) -> Result<Self::Output> {
+        Ok(self.decls)
+    }
+}
+
+/// How many declarations [`pour`] lets through from `order`.
+fn count(files: &[&[u8]], order: &[usize]) -> Result<u64> {
+    let declared = order
+        .par_iter()
+        .map(|&i| {
+            let names = vec![0];
+            read(
+                files[i],
+                Declared {
+                    names,
+                    decls: Vec::new(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = FxHashSet::default();
+    Ok(declared
+        .iter()
+        .flatten()
+        .filter(|n| n.is_none_or(|n| seen.insert(n)))
+        .count() as u64)
+}
+
+fn read<S: Sink>(bytes: &[u8], sink: S) -> Result<S::Output> {
+    if blean::sniff(bytes) {
+        blean::read(bytes, sink)
+    } else {
+        ndjson::read(bytes, sink)
     }
 }
 
@@ -297,18 +355,14 @@ fn pour<S: Sink>(files: &[&[u8]], order: &[usize], sink: &mut S) -> Result<Count
             names: &mut names,
             declared: &mut declared,
         };
-        let bytes = files[i];
-        if blean::sniff(bytes) {
-            blean::read(bytes, &mut shift)?;
-        } else {
-            ndjson::read(bytes, &mut shift)?;
-        }
+        read(files[i], &mut shift)?;
         next = shift.next;
     }
     Ok(next)
 }
 
-fn merge<S: Sink>(
+/// Join `files` in an order [`order`] gave, or one [`view`] gave for `root`.
+pub fn join_in<S: Sink>(
     files: &[&[u8]],
     order: &[usize],
     root: Option<&str>,
@@ -321,11 +375,10 @@ fn merge<S: Sink>(
     if let Some(o) = m.as_object_mut() {
         o.remove("module");
         if let Some(root) = root {
-            let mut n = Count(0);
-            pour(files, imports, &mut n)?;
+            let n = count(files, imports)?;
             o.insert(
                 "view".into(),
-                serde_json::json!({"module": root, "imported": n.0}),
+                serde_json::json!({"module": root, "imported": n}),
             );
         }
     }
@@ -361,20 +414,27 @@ type Out = Hashing<BufWriter<File>>;
 /// refers to its imports' constants by name, so joining the files gives a whole export,
 /// up to numbering and order, plus the internal constants nothing needs. Returns the files in module order.
 pub fn split(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
-    split_as(env, dir, blean, false)
+    split_each(env, dir, blean, false, &|| {})
 }
 
 /// Like [`split`], with each module written against what the module system shows it and
 /// its interface in `dir/public`.
 pub fn split_interfaces(env: &Env, dir: &Path, blean: bool) -> Result<Vec<PathBuf>> {
-    split_as(env, dir, blean, true)
+    split_each(env, dir, blean, true, &|| {})
 }
 
-fn split_as(env: &Env, dir: &Path, blean: bool, interfaces: bool) -> Result<Vec<PathBuf>> {
+/// [`split`] or [`split_interfaces`], calling `each` after every file written.
+pub fn split_each(
+    env: &Env,
+    dir: &Path,
+    blean: bool,
+    interfaces: bool,
+    each: &dyn Fn(),
+) -> Result<Vec<PathBuf>> {
     if blean {
-        split_with(env, dir, "blean", interfaces, Blean::new)
+        split_with(env, dir, "blean", interfaces, Blean::new, each)
     } else {
-        split_with(env, dir, "ndjson", interfaces, Ndjson::new)
+        split_with(env, dir, "ndjson", interfaces, Ndjson::new, each)
     }
 }
 
@@ -384,6 +444,7 @@ fn split_with<S: Sink<Output = Out>>(
     ext: &str,
     interfaces: bool,
     sink: impl Fn(Out) -> S,
+    each: &dyn Fn(),
 ) -> Result<Vec<PathBuf>> {
     let public = dir.join("public");
     std::fs::create_dir_all(if interfaces { &public } else { dir })?;
@@ -456,6 +517,7 @@ fn split_with<S: Sink<Output = Out>>(
             ex.meta_with(Some(meta))?;
             ex.module(m)?;
         }
+        each();
         let Some((_, _, next)) = files.get(k + 1) else {
             break;
         };
