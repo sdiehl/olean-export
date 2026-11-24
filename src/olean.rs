@@ -129,7 +129,7 @@ impl Image {
         let version = cstr(&bytes[7..40]);
         let minor = version
             .strip_prefix("4.")
-            .and_then(|v| v.split('.').next()?.parse::<u32>().ok());
+            .and_then(|v| v.split('.').next()?.parse().ok());
         if !minor.is_some_and(|m| SUPPORTED.contains(&m)) {
             return Err(Error::UnsupportedLean(version));
         }
@@ -354,11 +354,12 @@ fn le64(b: &[u8]) -> u64 {
 
 /// The decimal digits of the natural number with little-endian 64-bit `limbs`.
 ///
-/// Divide and conquer (malachite): converting one limb at a time is quadratic, and some
+/// Divide and conquer (dashu-int): converting one limb at a time is quadratic, and some
 /// developments hold literals of millions of digits (CFSG's certificates: the export spent
-/// over an hour here before).
+/// over an hour here before). Bytes, not words: dashu's word width depends on the platform.
 fn decimal(limbs: &[u64]) -> String {
-    malachite_nz::natural::Natural::from_limbs_asc(limbs).to_string()
+    let bytes: Vec<u8> = limbs.iter().flat_map(|l| l.to_le_bytes()).collect();
+    dashu_int::UBig::from_le_bytes(&bytes).to_string()
 }
 
 #[cfg(test)]

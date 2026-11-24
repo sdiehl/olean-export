@@ -334,18 +334,11 @@ fn nat_le(digits: &str) -> Result<Vec<u8>> {
     if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
         return Err(corrupt("keys: invalid natural literal"));
     }
-    // divide and conquer (malachite): digit by digit is quadratic on huge literals
-    let n: malachite_nz::natural::Natural = digits
-        .parse()
-        .map_err(|()| corrupt("keys: invalid natural literal"))?;
-    let mut v: Vec<u8> = n
-        .to_limbs_asc()
-        .iter()
-        .flat_map(|l| l.to_le_bytes())
-        .collect();
-    while v.len() > 1 && v.last() == Some(&0) {
-        v.pop();
-    }
+    // divide and conquer (dashu-int): digit by digit is quadratic on huge literals
+    let n = dashu_int::UBig::from_str_radix(digits, 10)
+        .map_err(|_| corrupt("keys: invalid natural literal"))?;
+    // minimal: no trailing zero bytes, and zero is empty
+    let mut v = n.to_le_bytes().into_vec();
     if v.is_empty() {
         v.push(0);
     }
