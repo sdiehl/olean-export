@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 (2026-11-26)
 
 - `unused` and `axioms` read terms on demand.
 - Add `deps`, what each declaration names, as NDJSON.
